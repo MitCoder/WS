@@ -49,6 +49,22 @@ def init_db():
         "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
         ("alice", "alicepw123", "user"),
     )
+
+    # Second table for the search-box demo (deliberately 4 columns, same as users,
+    # so a UNION-based injection lines up cleanly for the demo)
+    conn.execute(
+        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price TEXT)"
+    )
+    sample_products = [
+        ("Wireless Mouse", "Electronics", "$19.99"),
+        ("Standing Desk", "Furniture", "$249.00"),
+        ("USB-C Hub", "Electronics", "$34.50"),
+        ("Ergonomic Chair", "Furniture", "$179.99"),
+    ]
+    conn.executemany(
+        "INSERT INTO products (name, category, price) VALUES (?, ?, ?)", sample_products
+    )
+
     conn.commit()
     conn.close()
 
@@ -75,6 +91,30 @@ def attempt_login(username, password):
     return row, display_query, None
 
 
+def attempt_search(term):
+    """Returns (rows_list, query_string_for_display, error_or_None).
+    Product search box -- demonstrates data exfiltration via UNION-based injection,
+    as opposed to the login demo's auth-bypass angle."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if ModeState.vulnerable:
+        query = f"SELECT id, name, category, price FROM products WHERE name LIKE '%{term}%'"
+        try:
+            cur.execute(query)
+        except sqlite3.OperationalError as e:
+            conn.close()
+            return [], query, str(e)
+    else:
+        query = "SELECT id, name, category, price FROM products WHERE name LIKE ?"
+        cur.execute(query, (f"%{term}%",))
+
+    rows = cur.fetchall()
+    conn.close()
+    display_query = query if ModeState.vulnerable else f"{query}  params=({f'%{term}%'!r},)"
+    return rows, display_query, None
+
+
 PAGE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -94,9 +134,16 @@ PAGE_TEMPLATE = """
     .fail {{ background: #f8d7da; color: #721c24; }}
     .hint {{ color: #666; font-size: 0.9em; }}
     code {{ background: #eee; padding: 2px 5px; border-radius: 3px; }}
+    nav {{ margin-bottom: 20px; }}
+    nav a {{ margin-right: 15px; color: #2980b9; text-decoration: none; font-weight: bold; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9em; }}
+    th {{ background: #f0f0f0; }}
+    .leak {{ background: #fff3cd; }}
   </style>
 </head>
 <body>
+  <nav><a href="/login">Login Demo</a> | <a href="/search">Search Demo</a></nav>
   <h2>Workshop Login Demo &nbsp;<span class="mode">{mode}</span></h2>
 
   <form method="POST" action="/toggle" style="margin-bottom: 20px;">
@@ -110,6 +157,54 @@ PAGE_TEMPLATE = """
     <div>Username: <input name="username" value="{last_username}"></div>
     <div>Password: <input name="password" value="{last_password}"></div>
     <button type="submit">Login</button>
+  </form>
+  {result_html}
+</body>
+</html>
+"""
+
+SEARCH_PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SQLi Workshop Demo - Search</title>
+  <style>
+    body {{ font-family: -apple-system, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }}
+    h2 {{ color: #222; }}
+    .mode {{ display: inline-block; padding: 2px 10px; border-radius: 4px; color: white;
+             background: {mode_color}; font-weight: bold; font-size: 0.85em; }}
+    input {{ padding: 6px; margin: 4px 0; width: 350px; }}
+    button {{ padding: 8px 16px; margin-top: 8px; cursor: pointer; }}
+    .query-box {{ background: #1e1e1e; color: #0f0; padding: 12px; border-radius: 6px;
+                  font-family: monospace; white-space: pre-wrap; word-break: break-all; margin-top: 15px; }}
+    .hint {{ color: #666; font-size: 0.9em; }}
+    code {{ background: #eee; padding: 2px 5px; border-radius: 3px; }}
+    nav {{ margin-bottom: 20px; }}
+    nav a {{ margin-right: 15px; color: #2980b9; text-decoration: none; font-weight: bold; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9em; }}
+    th {{ background: #f0f0f0; }}
+    .leak {{ background: #fff3cd; }}
+  </style>
+</head>
+<body>
+  <nav><a href="/login">Login Demo</a> | <a href="/search">Search Demo</a></nav>
+  <h2>Product Search Demo &nbsp;<span class="mode">{mode}</span></h2>
+
+  <form method="POST" action="/toggle" style="margin-bottom: 20px;">
+    <button type="submit" style="background: {toggle_color}; color: white; border: none; border-radius: 4px; padding: 10px 18px; font-weight: bold;">
+      {toggle_label}
+    </button>
+  </form>
+
+  <p class="hint">
+    Try a normal search: <code>desk</code><br>
+    Then try a data-exfiltration payload:<br>
+    <code>zzz' UNION SELECT id, username, password, role FROM users--</code>
+  </p>
+  <form method="POST" action="/search">
+    <div>Search products: <input name="term" value="{last_term}"></div>
+    <button type="submit">Search</button>
   </form>
   {result_html}
 </body>
@@ -138,6 +233,25 @@ def render_page(last_username="", last_password="", result_html=""):
     )
 
 
+def render_search_page(last_term="", result_html=""):
+    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
+    mode_color = "#c0392b" if ModeState.vulnerable else "#27ae60"
+    if ModeState.vulnerable:
+        toggle_label = "Switch to FIXED (parameterized query)"
+        toggle_color = "#27ae60"
+    else:
+        toggle_label = "Switch to VULNERABLE (string concatenation)"
+        toggle_color = "#c0392b"
+    return SEARCH_PAGE_TEMPLATE.format(
+        mode=mode,
+        mode_color=mode_color,
+        toggle_label=toggle_label,
+        toggle_color=toggle_color,
+        last_term=last_term,
+        result_html=result_html,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # quiet default logging; we print our own query trace below
@@ -153,6 +267,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/login"):
             self._send_html(render_page())
+        elif self.path == "/search":
+            self._send_html(render_search_page())
         else:
             self.send_response(404)
             self.end_headers()
@@ -173,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
 
             row, display_query, error = attempt_login(username, password)
 
-            print(f"\n[{'VULNERABLE' if VULNERABLE_MODE else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
+            print(f"\n[{'VULNERABLE' if ModeState.vulnerable else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
 
             query_box = f'<div class="query-box">{display_query}</div>'
 
@@ -185,6 +301,40 @@ class Handler(BaseHTTPRequestHandler):
                 result_html = query_box + '<div class="result fail">LOGIN FAILED — invalid credentials.</div>'
 
             self._send_html(render_page(username, password, result_html))
+            return
+
+        if self.path == "/search":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            fields = parse_qs(body)
+            term = fields.get("term", [""])[0]
+
+            rows, display_query, error = attempt_search(term)
+
+            print(f"\n[{'VULNERABLE' if ModeState.vulnerable else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
+
+            query_box = f'<div class="query-box">{display_query}</div>'
+
+            if error:
+                result_html = query_box + f'<div class="result fail">SQL ERROR: {error}</div>'
+            elif rows:
+                # Flag rows that look like they came from the users table (leaked password-looking data)
+                table_rows = ""
+                for r in rows:
+                    is_leak = "Pass" in str(r[2]) or "!" in str(r[2]) if len(str(r[2])) > 0 else False
+                    row_class = "leak" if is_leak else ""
+                    table_rows += f'<tr class="{row_class}"><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td></tr>'
+                table_html = f"""
+                <table>
+                  <tr><th>id</th><th>name</th><th>category</th><th>price</th></tr>
+                  {table_rows}
+                </table>
+                """
+                result_html = query_box + table_html
+            else:
+                result_html = query_box + '<div class="result fail">No products found.</div>'
+
+            self._send_html(render_search_page(term, result_html))
         else:
             self.send_response(404)
             self.end_headers()
