@@ -1,0 +1,184 @@
+"""
+SQL Injection Workshop Demo - Web UI (zero dependencies)
+----------------------------------------------------------
+Pure standard-library Python. No pip install needed, no Flask, no Docker.
+Uses http.server (built into Python) to serve an HTML login form in the browser.
+
+Run:    python sqli_demo_web.py
+Visit:  http://127.0.0.1:5000/login
+
+Demo payloads to try in the "Username" field (password can be anything):
+    '                -> breaks query syntax, proves injection point exists
+    ' --             -> comments out the password check
+    ' OR 1=1--       -> classic auth bypass, logs in as first user in table
+
+Toggle VULNERABLE_MODE below to switch between broken and fixed behavior,
+then restart the script and refresh the browser.
+"""
+
+import sqlite3
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
+
+DB_PATH = "demo_users.db"
+PORT = 5000
+
+# ---- Toggle this to switch between vulnerable and fixed query logic ----
+VULNERABLE_MODE = True
+# --------------------------------------------------------------------
+
+
+def init_db():
+    """Create a fresh demo DB with a couple of sample users."""
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+        ("admin", "S3cretAdminPass!", "admin"),
+    )
+    conn.execute(
+        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+        ("alice", "alicepw123", "user"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def attempt_login(username, password):
+    """Returns (row_or_None, query_string_for_display, error_or_None)"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if VULNERABLE_MODE:
+        query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
+        try:
+            cur.execute(query)
+        except sqlite3.OperationalError as e:
+            conn.close()
+            return None, query, str(e)
+    else:
+        query = "SELECT * FROM users WHERE username = ? AND password = ?"
+        cur.execute(query, (username, password))
+
+    row = cur.fetchone()
+    conn.close()
+    display_query = query if VULNERABLE_MODE else f"{query}  params=({username!r}, {password!r})"
+    return row, display_query, None
+
+
+PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SQLi Workshop Demo</title>
+  <style>
+    body {{ font-family: -apple-system, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }}
+    h2 {{ color: #222; }}
+    .mode {{ display: inline-block; padding: 2px 10px; border-radius: 4px; color: white;
+             background: {mode_color}; font-weight: bold; font-size: 0.85em; }}
+    input {{ padding: 6px; margin: 4px 0; width: 250px; }}
+    button {{ padding: 8px 16px; margin-top: 8px; cursor: pointer; }}
+    .query-box {{ background: #1e1e1e; color: #0f0; padding: 12px; border-radius: 6px;
+                  font-family: monospace; white-space: pre-wrap; word-break: break-all; margin-top: 15px; }}
+    .result {{ padding: 12px; border-radius: 6px; margin-top: 10px; }}
+    .success {{ background: #d4edda; color: #155724; }}
+    .fail {{ background: #f8d7da; color: #721c24; }}
+    .hint {{ color: #666; font-size: 0.9em; }}
+    code {{ background: #eee; padding: 2px 5px; border-radius: 3px; }}
+  </style>
+</head>
+<body>
+  <h2>Workshop Login Demo &nbsp;<span class="mode">{mode}</span></h2>
+  <p class="hint">Try payloads in the Username field: <code>'</code> &nbsp; <code>' --</code> &nbsp; <code>' OR 1=1--</code></p>
+  <form method="POST" action="/login">
+    <div>Username: <input name="username" value="{last_username}"></div>
+    <div>Password: <input name="password" value="{last_password}"></div>
+    <button type="submit">Login</button>
+  </form>
+  {result_html}
+</body>
+</html>
+"""
+
+
+def render_page(last_username="", last_password="", result_html=""):
+    mode = "VULNERABLE" if VULNERABLE_MODE else "FIXED"
+    mode_color = "#c0392b" if VULNERABLE_MODE else "#27ae60"
+    return PAGE_TEMPLATE.format(
+        mode=mode,
+        mode_color=mode_color,
+        last_username=last_username,
+        last_password=last_password,
+        result_html=result_html,
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # quiet default logging; we print our own query trace below
+
+    def _send_html(self, html):
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/login"):
+            self._send_html(render_page())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/login":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            fields = parse_qs(body)
+            username = fields.get("username", [""])[0]
+            password = fields.get("password", [""])[0]
+
+            row, display_query, error = attempt_login(username, password)
+
+            print(f"\n[{'VULNERABLE' if VULNERABLE_MODE else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
+
+            query_box = f'<div class="query-box">{display_query}</div>'
+
+            if error:
+                result_html = query_box + f'<div class="result fail">SQL ERROR: {error} <br>(this alone proves the injection point exists)</div>'
+            elif row:
+                result_html = query_box + f'<div class="result success">LOGIN SUCCESSFUL — logged in as <b>{row[1]}</b> (role: {row[3]})</div>'
+            else:
+                result_html = query_box + '<div class="result fail">LOGIN FAILED — invalid credentials.</div>'
+
+            self._send_html(render_page(username, password, result_html))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def main():
+    init_db()
+    mode = "VULNERABLE" if VULNERABLE_MODE else "FIXED"
+    print("=" * 60)
+    print(f"  SQL Injection Workshop Demo (Web UI)   [mode: {mode}]")
+    print("=" * 60)
+    print(f"Visit: http://127.0.0.1:{PORT}/login")
+    print("Press Ctrl+C to stop.\n")
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
