@@ -12,8 +12,8 @@ Demo payloads to try in the "Username" field (password can be anything):
     ' --             -> comments out the password check
     ' OR 1=1--       -> classic auth bypass, logs in as first user in table
 
-Toggle VULNERABLE_MODE below to switch between broken and fixed behavior,
-then restart the script and refresh the browser.
+The page includes a button to toggle live between VULNERABLE and FIXED mode
+-- no restart needed, just click and try the same payload again.
 """
 
 import sqlite3
@@ -24,9 +24,13 @@ from urllib.parse import parse_qs
 DB_PATH = "demo_users.db"
 PORT = 5000
 
-# ---- Toggle this to switch between vulnerable and fixed query logic ----
+# ---- Starting mode. Can also be toggled live from the web page itself. ----
 VULNERABLE_MODE = True
 # --------------------------------------------------------------------
+
+# Mutable holder so the toggle route can flip this at runtime
+class ModeState:
+    vulnerable = VULNERABLE_MODE
 
 
 def init_db():
@@ -54,7 +58,7 @@ def attempt_login(username, password):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    if VULNERABLE_MODE:
+    if ModeState.vulnerable:
         query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
         try:
             cur.execute(query)
@@ -67,7 +71,7 @@ def attempt_login(username, password):
 
     row = cur.fetchone()
     conn.close()
-    display_query = query if VULNERABLE_MODE else f"{query}  params=({username!r}, {password!r})"
+    display_query = query if ModeState.vulnerable else f"{query}  params=({username!r}, {password!r})"
     return row, display_query, None
 
 
@@ -94,6 +98,13 @@ PAGE_TEMPLATE = """
 </head>
 <body>
   <h2>Workshop Login Demo &nbsp;<span class="mode">{mode}</span></h2>
+
+  <form method="POST" action="/toggle" style="margin-bottom: 20px;">
+    <button type="submit" style="background: {toggle_color}; color: white; border: none; border-radius: 4px; padding: 10px 18px; font-weight: bold;">
+      {toggle_label}
+    </button>
+  </form>
+
   <p class="hint">Try payloads in the Username field: <code>'</code> &nbsp; <code>' --</code> &nbsp; <code>' OR 1=1--</code></p>
   <form method="POST" action="/login">
     <div>Username: <input name="username" value="{last_username}"></div>
@@ -107,11 +118,20 @@ PAGE_TEMPLATE = """
 
 
 def render_page(last_username="", last_password="", result_html=""):
-    mode = "VULNERABLE" if VULNERABLE_MODE else "FIXED"
-    mode_color = "#c0392b" if VULNERABLE_MODE else "#27ae60"
+    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
+    mode_color = "#c0392b" if ModeState.vulnerable else "#27ae60"
+    # Button always offers to switch TO the other mode
+    if ModeState.vulnerable:
+        toggle_label = "Switch to FIXED (parameterized query)"
+        toggle_color = "#27ae60"
+    else:
+        toggle_label = "Switch to VULNERABLE (string concatenation)"
+        toggle_color = "#c0392b"
     return PAGE_TEMPLATE.format(
         mode=mode,
         mode_color=mode_color,
+        toggle_label=toggle_label,
+        toggle_color=toggle_color,
         last_username=last_username,
         last_password=last_password,
         result_html=result_html,
@@ -138,6 +158,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.path == "/toggle":
+            ModeState.vulnerable = not ModeState.vulnerable
+            print(f"\n[MODE TOGGLED] Now running in {'VULNERABLE' if ModeState.vulnerable else 'FIXED'} mode\n")
+            self._send_html(render_page())
+            return
+
         if self.path == "/login":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length).decode("utf-8")
@@ -166,11 +192,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    mode = "VULNERABLE" if VULNERABLE_MODE else "FIXED"
+    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
     print("=" * 60)
     print(f"  SQL Injection Workshop Demo (Web UI)   [mode: {mode}]")
     print("=" * 60)
     print(f"Visit: http://127.0.0.1:{PORT}/login")
+    print("Click the button on the page to toggle VULNERABLE / FIXED mode live.")
     print("Press Ctrl+C to stop.\n")
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     try:
