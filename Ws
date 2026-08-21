@@ -1,361 +1,174 @@
-"""
-SQL Injection Workshop Demo - Web UI (zero dependencies)
-----------------------------------------------------------
-Pure standard-library Python. No pip install needed, no Flask, no Docker.
-Uses http.server (built into Python) to serve an HTML login form in the browser.
+---
+name: juice-shop-benchmark
+description: Benchmark Codex Security / Daybreak's threat modeling, reachability analysis, exploit-validated severity, and prioritization against a locally-cloned OWASP Juice Shop instance, cross-referenced with Snyk's static reachability signal, using Juice Shop's documented challenge set as ground truth. Detection and prioritization only — no remediation or patching.
+---
 
-Run:    python sqli_demo_web.py
-Visit:  http://127.0.0.1:5000/login
+# Juice Shop Security Scan Benchmark (Detection & Prioritization Only)
 
-Demo payloads to try in the "Username" field (password can be anything):
-    '                -> breaks query syntax, proves injection point exists
-    ' --             -> comments out the password check
-    ' OR 1=1--       -> classic auth bypass, logs in as first user in table
+## Purpose
 
-The page includes a button to toggle live between VULNERABLE and FIXED mode
--- no restart needed, just click and try the same payload again.
-"""
+This skill drives a repeatable workflow for evaluating Codex Security's
+threat modeling, reachability analysis, exploit-validated severity, and
+prioritization against OWASP Juice Shop — an intentionally vulnerable,
+open-source training application with a fully documented challenge set.
+It also defines how to fuse Codex Security's findings with Snyk's static
+reachability signal into a single normalized priority tier.
 
-import sqlite3
-import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs
+**Scope note:** this skill is detection and prioritization only. It does
+NOT generate patches, open PRs, or modify code. If a later phase adds
+remediation, it should be a separate skill.
 
-DB_PATH = "demo_users.db"
-PORT = 5000
+## Scope and Constraints
 
-# ---- Starting mode. Can also be toggled live from the web page itself. ----
-VULNERABLE_MODE = True
-# --------------------------------------------------------------------
+- Target ONLY the local Juice Shop clone at the path you point Codex to.
+  Never point this workflow at any other host, domain, or repository.
+- Do not modify any files in the target repo. This workflow is read-only
+  with respect to the codebase — findings, threat model edits, and
+  reports only.
+- Treat SOLUTIONS.md and the official companion guide as ground truth for
+  scoring, not as a target to "beat" — the goal is honest measurement of
+  scanner accuracy, not maximizing a discovered-count metric.
+- This workflow assumes an isolated local/sandboxed environment. Do not
+  run against an internet-exposed instance.
 
-# Mutable holder so the toggle route can flip this at runtime
-class ModeState:
-    vulnerable = VULNERABLE_MODE
+## Prerequisites
 
+- Juice Shop cloned locally: git clone https://github.com/juice-shop/juice-shop.git --depth 1
+- Juice Shop running locally, via Docker if native npm install hits
+  build issues (e.g. node-gyp/Python distutils conflicts):
+  docker run --rm -p 127.0.0.1:3000:3000 bkimminich/juice-shop
+- SOLUTIONS.md present in the cloned repo (root of the project)
+- Codex Security enabled, via EITHER:
+  - Codex Desktop app, signed in, with Codex Security enabled for the
+    workspace (Workspace Settings > Permissions > Codex Cloud > Allow
+    members to use Codex Security), OR
+  - Codex Security CLI available: npx @openai/codex-security --version
+- (Optional, for the fusion step) Snyk CLI or Snyk Code/Open Source
+  configured with reachability analysis enabled for the org
+  (Organization Settings > Snyk Open Source > Enable reachability
+  analysis)
 
-def init_db():
-    """Create a fresh demo DB with a couple of sample users."""
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, password TEXT, role TEXT)"
-    )
-    conn.execute(
-        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-        ("admin", "S3cretAdminPass!", "admin"),
-    )
-    conn.execute(
-        "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-        ("alice", "alicepw123", "user"),
-    )
+## Workflow
 
-    # Second table for the search-box demo (deliberately 4 columns, same as users,
-    # so a UNION-based injection lines up cleanly for the demo)
-    conn.execute(
-        "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price TEXT)"
-    )
-    sample_products = [
-        ("Wireless Mouse", "Electronics", "$19.99"),
-        ("Standing Desk", "Furniture", "$249.00"),
-        ("USB-C Hub", "Electronics", "$34.50"),
-        ("Ergonomic Chair", "Furniture", "$179.99"),
-    ]
-    conn.executemany(
-        "INSERT INTO products (name, category, price) VALUES (?, ?, ?)", sample_products
-    )
+Each step below shows the Desktop (chat) form first, then the CLI form.
+Use whichever is available; both produce equivalent output.
 
-    conn.commit()
-    conn.close()
+### 1. Connect the repository and review the threat model
 
+**Desktop:** Open Codex Security in the desktop app and add the local
+Juice Shop folder as the scan target. On first connection, Codex Security
+builds a codebase-specific threat model automatically — attacker entry
+points, trust boundaries, sensitive data, and high-impact code paths.
+Review/edit the threat model before scanning so it reflects that this is
+a training app with intentionally reachable vulnerabilities, rather than
+letting Codex spend effort debating realism.
 
-def attempt_login(username, password):
-    """Returns (row_or_None, query_string_for_display, error_or_None)"""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+**CLI:** The threat model is generated automatically on first scan; no
+separate flag is required. A custom framing can be supplied via:
 
-    if ModeState.vulnerable:
-        query = f"SELECT * FROM users WHERE username = '{username}' AND password = '{password}'"
-        try:
-            cur.execute(query)
-        except sqlite3.OperationalError as e:
-            conn.close()
-            return None, query, str(e)
-    else:
-        query = "SELECT * FROM users WHERE username = ? AND password = ?"
-        cur.execute(query, (username, password))
+    npx @openai/codex-security scan . --scan-prompt-file threat-model-note.md
 
-    row = cur.fetchone()
-    conn.close()
-    display_query = query if ModeState.vulnerable else f"{query}  params=({username!r}, {password!r})"
-    return row, display_query, None
+where threat-model-note.md briefly states the app is an intentionally
+vulnerable training target.
 
+### 2. Baseline scan — detection only, no patch generation
 
-def attempt_search(term):
-    """Returns (rows_list, query_string_for_display, error_or_None).
-    Product search box -- demonstrates data exfiltration via UNION-based injection,
-    as opposed to the login demo's auth-bypass angle."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
+**Desktop:**
 
-    if ModeState.vulnerable:
-        query = f"SELECT id, name, category, price FROM products WHERE name LIKE '%{term}%'"
-        try:
-            cur.execute(query)
-        except sqlite3.OperationalError as e:
-            conn.close()
-            return [], query, str(e)
-    else:
-        query = "SELECT id, name, category, price FROM products WHERE name LIKE ?"
-        cur.execute(query, (f"%{term}%",))
+    Use $codex-security:security-scan to scan this repository for security
+    vulnerabilities. Detection and prioritization only — do not generate
+    patches.
 
-    rows = cur.fetchall()
-    conn.close()
-    display_query = query if ModeState.vulnerable else f"{query}  params=({f'%{term}%'!r},)"
-    return rows, display_query, None
+**CLI:**
 
+    npx @openai/codex-security scan . --json
 
-PAGE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>SQLi Workshop Demo</title>
-  <style>
-    body {{ font-family: -apple-system, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }}
-    h2 {{ color: #222; }}
-    .mode {{ display: inline-block; padding: 2px 10px; border-radius: 4px; color: white;
-             background: {mode_color}; font-weight: bold; font-size: 0.85em; }}
-    input {{ padding: 6px; margin: 4px 0; width: 250px; }}
-    button {{ padding: 8px 16px; margin-top: 8px; cursor: pointer; }}
-    .query-box {{ background: #1e1e1e; color: #0f0; padding: 12px; border-radius: 6px;
-                  font-family: monospace; white-space: pre-wrap; word-break: break-all; margin-top: 15px; }}
-    .result {{ padding: 12px; border-radius: 6px; margin-top: 10px; }}
-    .success {{ background: #d4edda; color: #155724; }}
-    .fail {{ background: #f8d7da; color: #721c24; }}
-    .hint {{ color: #666; font-size: 0.9em; }}
-    code {{ background: #eee; padding: 2px 5px; border-radius: 3px; }}
-    nav {{ margin-bottom: 20px; }}
-    nav a {{ margin-right: 15px; color: #2980b9; text-decoration: none; font-weight: bold; }}
-    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
-    th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9em; }}
-    th {{ background: #f0f0f0; }}
-    .leak {{ background: #fff3cd; }}
-  </style>
-</head>
-<body>
-  <nav><a href="/login">Login Demo</a> | <a href="/search">Search Demo</a></nav>
-  <h2>Workshop Login Demo &nbsp;<span class="mode">{mode}</span></h2>
+(Do not pass `--patch` or `--create-pr` — those trigger remediation,
+which is explicitly out of scope for this skill.)
 
-  <form method="POST" action="/toggle" style="margin-bottom: 20px;">
-    <button type="submit" style="background: {toggle_color}; color: white; border: none; border-radius: 4px; padding: 10px 18px; font-weight: bold;">
-      {toggle_label}
-    </button>
-  </form>
+### 3. Review findings: reachability and exploit validation
 
-  <p class="hint">Try payloads in the Username field: <code>'</code> &nbsp; <code>' --</code> &nbsp; <code>' OR 1=1--</code></p>
-  <form method="POST" action="/login">
-    <div>Username: <input name="username" value="{last_username}"></div>
-    <div>Password: <input name="password" value="{last_password}"></div>
-    <button type="submit">Login</button>
-  </form>
-  {result_html}
-</body>
-</html>
-"""
+For each finding, record:
+- **Validation status** — reproduced in Codex's isolated sandbox
+  (exploit-confirmed) vs. only statically/threat-model flagged
+- **Reachability** — does the attack path align with the threat model's
+  entry points and trust boundaries?
+- **Assigned severity** — does it track with demonstrated exploitability,
+  not just theoretical pattern severity?
 
-SEARCH_PAGE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-  <title>SQLi Workshop Demo - Search</title>
-  <style>
-    body {{ font-family: -apple-system, Arial, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }}
-    h2 {{ color: #222; }}
-    .mode {{ display: inline-block; padding: 2px 10px; border-radius: 4px; color: white;
-             background: {mode_color}; font-weight: bold; font-size: 0.85em; }}
-    input {{ padding: 6px; margin: 4px 0; width: 350px; }}
-    button {{ padding: 8px 16px; margin-top: 8px; cursor: pointer; }}
-    .query-box {{ background: #1e1e1e; color: #0f0; padding: 12px; border-radius: 6px;
-                  font-family: monospace; white-space: pre-wrap; word-break: break-all; margin-top: 15px; }}
-    .hint {{ color: #666; font-size: 0.9em; }}
-    code {{ background: #eee; padding: 2px 5px; border-radius: 3px; }}
-    nav {{ margin-bottom: 20px; }}
-    nav a {{ margin-right: 15px; color: #2980b9; text-decoration: none; font-weight: bold; }}
-    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
-    th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 0.9em; }}
-    th {{ background: #f0f0f0; }}
-    .leak {{ background: #fff3cd; }}
-  </style>
-</head>
-<body>
-  <nav><a href="/login">Login Demo</a> | <a href="/search">Search Demo</a></nav>
-  <h2>Product Search Demo &nbsp;<span class="mode">{mode}</span></h2>
+Source data: report.md (human-readable) and findings.json / SARIF /
+coverage.json (structured) from either the Desktop export or CLI output.
 
-  <form method="POST" action="/toggle" style="margin-bottom: 20px;">
-    <button type="submit" style="background: {toggle_color}; color: white; border: none; border-radius: 4px; padding: 10px 18px; font-weight: bold;">
-      {toggle_label}
-    </button>
-  </form>
+### 4. Run Snyk reachability in parallel (fusion input)
 
-  <p class="hint">
-    Try a normal search: <code>desk</code><br>
-    Then try a data-exfiltration payload:<br>
-    <code>zzz' UNION SELECT id, username, password, role FROM users--</code>
-  </p>
-  <form method="POST" action="/search">
-    <div>Search products: <input name="term" value="{last_term}"></div>
-    <button type="submit">Search</button>
-  </form>
-  {result_html}
-</body>
-</html>
-"""
+Run your existing Snyk scan against the same commit/tag of Juice Shop,
+with reachability analysis enabled, so its call-graph-based reachability
+signal (static: "is the vulnerable function ever called") is available
+for the fusion step. This is a structurally different signal from Codex's
+exploit-validated reachability — see the fusion table in step 6.
 
+### 5. Cross-reference against ground truth
 
-def render_page(last_username="", last_password="", result_html=""):
-    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
-    mode_color = "#c0392b" if ModeState.vulnerable else "#27ae60"
-    # Button always offers to switch TO the other mode
-    if ModeState.vulnerable:
-        toggle_label = "Switch to FIXED (parameterized query)"
-        toggle_color = "#27ae60"
-    else:
-        toggle_label = "Switch to VULNERABLE (string concatenation)"
-        toggle_color = "#c0392b"
-    return PAGE_TEMPLATE.format(
-        mode=mode,
-        mode_color=mode_color,
-        toggle_label=toggle_label,
-        toggle_color=toggle_color,
-        last_username=last_username,
-        last_password=last_password,
-        result_html=result_html,
-    )
+Compare Codex findings against the challenge list in SOLUTIONS.md and the
+official companion guide. For each known challenge category (SQLi,
+XSS — reflected/stored/DOM, broken auth, IDOR, XXE, SSRF, insecure
+deserialization, vulnerable dependencies, security misconfiguration,
+insufficient logging), record:
+- True positive / false negative / false positive
+- Whether severity matched real-world exploitability
+- Whether the finding is a "pattern-matchable" class (SQLi, XSS) or a
+  "logic/reasoning" class (IDOR, auth bypass, business logic) — score
+  these separately, since Codex Security and Snyk have different
+  strengths per class (see prior discussion: Snyk's SCA/pattern-based
+  SAST is stronger on textbook injection classes; Codex is stronger on
+  authorization/logic flaws requiring intent-aware reasoning).
 
+### 6. Fuse Snyk reachability + Codex reachability/validation into a priority tier
 
-def render_search_page(last_term="", result_html=""):
-    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
-    mode_color = "#c0392b" if ModeState.vulnerable else "#27ae60"
-    if ModeState.vulnerable:
-        toggle_label = "Switch to FIXED (parameterized query)"
-        toggle_color = "#27ae60"
-    else:
-        toggle_label = "Switch to VULNERABLE (string concatenation)"
-        toggle_color = "#c0392b"
-    return SEARCH_PAGE_TEMPLATE.format(
-        mode=mode,
-        mode_color=mode_color,
-        toggle_label=toggle_label,
-        toggle_color=toggle_color,
-        last_term=last_term,
-        result_html=result_html,
-    )
+For each finding present in either tool's output, assign a combined tier:
 
+| Snyk reachability | Codex validation | Combined tier | Meaning |
+|---|---|---|---|
+| Reachable | Validated/reproduced | Tier 1 — confirmed | Both structural and demonstrated evidence agree; highest confidence |
+| Reachable | No Codex finding | Tier 2 — statically confirmed | Trust Snyk's signal; Codex may not have explored that path (e.g. pure dependency CVE, not logic-driven) |
+| Unreachable | Validated/reproduced | Tier 3 — conflict, investigate | Codex demonstrated exploitability where Snyk's call graph says the path is dead; check for dynamic dispatch, reflection, or config-driven code Snyk's static call graph may miss |
+| Reachable | Attempted, failed to reproduce | Tier 3b — conflict, investigate | Snyk says a path exists but Codex could not trigger it; check whether Snyk is overcounting (called but not attacker-controllable) or Codex's sandbox lacked correct preconditions |
+| Unreachable | No finding | Tier 4 — low priority | Both signals agree; deprioritize |
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # quiet default logging; we print our own query trace below
+Route Tier 3/3b conflicts for manual review rather than auto-resolving —
+these are the cases most worth investigating by hand.
 
-    def _send_html(self, html):
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+### 7. Score summary
 
-    def do_GET(self):
-        if self.path in ("/", "/login"):
-            self._send_html(render_page())
-        elif self.path == "/search":
-            self._send_html(render_search_page())
-        else:
-            self.send_response(404)
-            self.end_headers()
+| Metric | Result |
+|---|---|
+| Total known challenges | |
+| True positives (Codex) | |
+| False negatives (Codex) | |
+| False positives (Codex) | |
+| Findings with correct reachability assessment | |
+| Findings with severity matching real exploitability | |
+| Pattern-matchable class: Codex vs. Snyk recall | |
+| Logic/reasoning class: Codex vs. Snyk recall | |
+| Tier 1 (confirmed) count | |
+| Tier 3 / 3b (conflict) count | |
+| Tier 4 (low priority) count | |
+| Time: baseline scan | |
 
-    def do_POST(self):
-        if self.path == "/toggle":
-            ModeState.vulnerable = not ModeState.vulnerable
-            print(f"\n[MODE TOGGLED] Now running in {'VULNERABLE' if ModeState.vulnerable else 'FIXED'} mode\n")
-            self._send_html(render_page())
-            return
+## Notes for Reporting
 
-        if self.path == "/login":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            fields = parse_qs(body)
-            username = fields.get("username", [""])[0]
-            password = fields.get("password", [""])[0]
-
-            row, display_query, error = attempt_login(username, password)
-
-            print(f"\n[{'VULNERABLE' if ModeState.vulnerable else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
-
-            query_box = f'<div class="query-box">{display_query}</div>'
-
-            if error:
-                result_html = query_box + f'<div class="result fail">SQL ERROR: {error} <br>(this alone proves the injection point exists)</div>'
-            elif row:
-                result_html = query_box + f'<div class="result success">LOGIN SUCCESSFUL — logged in as <b>{row[1]}</b> (role: {row[3]})</div>'
-            else:
-                result_html = query_box + '<div class="result fail">LOGIN FAILED — invalid credentials.</div>'
-
-            self._send_html(render_page(username, password, result_html))
-            return
-
-        if self.path == "/search":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            fields = parse_qs(body)
-            term = fields.get("term", [""])[0]
-
-            rows, display_query, error = attempt_search(term)
-
-            print(f"\n[{'VULNERABLE' if ModeState.vulnerable else 'FIXED'} QUERY EXECUTED]:\n  {display_query}\n")
-
-            query_box = f'<div class="query-box">{display_query}</div>'
-
-            if error:
-                result_html = query_box + f'<div class="result fail">SQL ERROR: {error}</div>'
-            elif rows:
-                # Flag rows that look like they came from the users table (leaked password-looking data)
-                table_rows = ""
-                for r in rows:
-                    is_leak = "Pass" in str(r[2]) or "!" in str(r[2]) if len(str(r[2])) > 0 else False
-                    row_class = "leak" if is_leak else ""
-                    table_rows += f'<tr class="{row_class}"><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td></tr>'
-                table_html = f"""
-                <table>
-                  <tr><th>id</th><th>name</th><th>category</th><th>price</th></tr>
-                  {table_rows}
-                </table>
-                """
-                result_html = query_box + table_html
-            else:
-                result_html = query_box + '<div class="result fail">No products found.</div>'
-
-            self._send_html(render_search_page(term, result_html))
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-
-def main():
-    init_db()
-    mode = "VULNERABLE" if ModeState.vulnerable else "FIXED"
-    print("=" * 60)
-    print(f"  SQL Injection Workshop Demo (Web UI)   [mode: {mode}]")
-    print("=" * 60)
-    print(f"Visit: http://127.0.0.1:{PORT}/login")
-    print("Click the button on the page to toggle VULNERABLE / FIXED mode live.")
-    print("Press Ctrl+C to stop.\n")
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        server.server_close()
-
-
-if __name__ == "__main__":
-    main()
+- Keep raw findings (report.md, findings.json, Snyk export) alongside the
+  summary for auditability.
+- Flag any finding where Codex Security's severity/priority disagreed
+  meaningfully with actual exploitability documented in the companion
+  guide.
+- Flag any case where the threat model's stated trust boundaries didn't
+  match where a finding was actually surfaced — a reachability miss
+  worth noting separately from a plain false positive/negative.
+- Tier 3/3b conflicts are the most valuable output of this exercise —
+  they're where the two tools' different methodologies (static call
+  graph vs. threat-model-guided dynamic validation) disagree, and
+  resolving why is more informative than either tool's raw finding count.
+- Remediation/patch generation is explicitly out of scope for this skill.
+  If you later want to test Codex Security's patch-and-verify flow, do
+  that as a separate, deliberate step outside this benchmark.
