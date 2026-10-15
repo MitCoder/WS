@@ -1,174 +1,174 @@
----
-name: juice-shop-benchmark
-description: Benchmark Codex Security / Daybreak's threat modeling, reachability analysis, exploit-validated severity, and prioritization against a locally-cloned OWASP Juice Shop instance, cross-referenced with Snyk's static reachability signal, using Juice Shop's documented challenge set as ground truth. Detection and prioritization only — no remediation or patching.
----
+#!/usr/bin/env python3
+"""Simple orchestrator: intake SQS (S3 events) -> pick a pool -> pool queue + ASG scale-up.
 
-# Juice Shop Security Scan Benchmark (Detection & Prioritization Only)
+Strategy             Router and Pool are swappable behaviours.
+Factory              create_pools() builds Pool objects from config (POOLS).
+Dependency injection Orchestrator and pools receive their AWS clients.
 
-## Purpose
+Env: AWS_REGION, BUCKET, INTAKE_QUEUE_URL, POOLS
+POOLS example: [{"name":"docker","queue":"<url>","asg":"<name>","max":5}]
+"""
+import json
+import logging
+import os
+import re
+import urllib.parse
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
-This skill drives a repeatable workflow for evaluating Codex Security's
-threat modeling, reachability analysis, exploit-validated severity, and
-prioritization against OWASP Juice Shop — an intentionally vulnerable,
-open-source training application with a fully documented challenge set.
-It also defines how to fuse Codex Security's findings with Snyk's static
-reachability signal into a single normalized priority tier.
+import boto3
 
-**Scope note:** this skill is detection and prioritization only. It does
-NOT generate patches, open PRs, or modify code. If a later phase adds
-remediation, it should be a separate skill.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("orchestrator")
 
-## Scope and Constraints
+KEY_RE = re.compile(r"^inbox/[A-Za-z0-9._/-]{1,200}\.json$")
 
-- Target ONLY the local Juice Shop clone at the path you point Codex to.
-  Never point this workflow at any other host, domain, or repository.
-- Do not modify any files in the target repo. This workflow is read-only
-  with respect to the codebase — findings, threat model edits, and
-  reports only.
-- Treat SOLUTIONS.md and the official companion guide as ground truth for
-  scoring, not as a target to "beat" — the goal is honest measurement of
-  scanner accuracy, not maximizing a discovered-count metric.
-- This workflow assumes an isolated local/sandboxed environment. Do not
-  run against an internet-exposed instance.
 
-## Prerequisites
+@dataclass(frozen=True)
+class Job:
+    job_id: str
+    key: str      # S3 key of the job spec
+    spec: dict
 
-- Juice Shop cloned locally: git clone https://github.com/juice-shop/juice-shop.git --depth 1
-- Juice Shop running locally, via Docker if native npm install hits
-  build issues (e.g. node-gyp/Python distutils conflicts):
-  docker run --rm -p 127.0.0.1:3000:3000 bkimminich/juice-shop
-- SOLUTIONS.md present in the cloned repo (root of the project)
-- Codex Security enabled, via EITHER:
-  - Codex Desktop app, signed in, with Codex Security enabled for the
-    workspace (Workspace Settings > Permissions > Codex Cloud > Allow
-    members to use Codex Security), OR
-  - Codex Security CLI available: npx @openai/codex-security --version
-- (Optional, for the fusion step) Snyk CLI or Snyk Code/Open Source
-  configured with reachability analysis enabled for the org
-  (Organization Settings > Snyk Open Source > Enable reachability
-  analysis)
 
-## Workflow
+# ------------------------------------------------------------ Strategy 1: pools
+class Pool(ABC):
+    """A place jobs can run."""
 
-Each step below shows the Desktop (chat) form first, then the CLI form.
-Use whichever is available; both produce equivalent output.
+    @abstractmethod
+    def submit(self, job):
+        ...
 
-### 1. Connect the repository and review the threat model
 
-**Desktop:** Open Codex Security in the desktop app and add the local
-Juice Shop folder as the scan target. On first connection, Codex Security
-builds a codebase-specific threat model automatically — attacker entry
-points, trust boundaries, sensitive data, and high-impact code paths.
-Review/edit the threat model before scanning so it reflects that this is
-a training app with intentionally reachable vulnerabilities, rather than
-letting Codex spend effort debating realism.
+class AsgQueuePool(Pool):
+    """Every pool that is 'SQS queue + ASG'. Differences live in config, not code."""
 
-**CLI:** The threat model is generated automatically on first scan; no
-separate flag is required. A custom framing can be supplied via:
+    def __init__(self, name, queue_url, asg_name, max_size, sqs, autoscaling):
+        self.name = name
+        self.queue_url = queue_url
+        self.asg_name = asg_name
+        self.max_size = max_size
+        self.sqs = sqs
+        self.autoscaling = autoscaling
 
-    npx @openai/codex-security scan . --scan-prompt-file threat-model-note.md
+    def submit(self, job):
+        self.sqs.send_message(
+            QueueUrl=self.queue_url,
+            MessageBody=json.dumps({"job_id": job.job_id, "key": job.key}))
+        self._scale_up()
+        log.info("job %s -> pool %s", job.job_id, self.name)
 
-where threat-model-note.md briefly states the app is an intentionally
-vulnerable training target.
+    def _scale_up(self):
+        group = self.autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[self.asg_name])["AutoScalingGroups"][0]
+        desired = group["DesiredCapacity"]
+        if desired < self.max_size:
+            self.autoscaling.set_desired_capacity(
+                AutoScalingGroupName=self.asg_name,
+                DesiredCapacity=desired + 1, HonorCooldown=False)
+            log.info("pool %s: asg %s -> %d", self.name, self.asg_name, desired + 1)
+        else:
+            log.info("pool %s at max; job waits in queue", self.name)
 
-### 2. Baseline scan — detection only, no patch generation
 
-**Desktop:**
+# ------------------------------------------------------------ Factory
+POOL_TYPES = {"asg_queue": AsgQueuePool}   # add a subclass here only if behaviour differs
 
-    Use $codex-security:security-scan to scan this repository for security
-    vulnerabilities. Detection and prioritization only — do not generate
-    patches.
 
-**CLI:**
+def create_pools(pools_json, sqs, autoscaling):
+    pools = {}
+    for item in json.loads(pools_json):
+        pool_class = POOL_TYPES[item.get("type", "asg_queue")]
+        pools[item["name"]] = pool_class(
+            name=item["name"],
+            queue_url=item["queue"],
+            asg_name=item["asg"],
+            max_size=int(item["max"]),
+            sqs=sqs,
+            autoscaling=autoscaling)
+    return pools
 
-    npx @openai/codex-security scan . --json
 
-(Do not pass `--patch` or `--create-pr` — those trigger remediation,
-which is explicitly out of scope for this skill.)
+# ------------------------------------------------------------ Strategy 2: routing
+class Router(ABC):
+    @abstractmethod
+    def select(self, job, pools):
+        """Return the Pool that should run this job."""
 
-### 3. Review findings: reachability and exploit validation
 
-For each finding, record:
-- **Validation status** — reproduced in Codex's isolated sandbox
-  (exploit-confirmed) vs. only statically/threat-model flagged
-- **Reachability** — does the attack path align with the threat model's
-  entry points and trust boundaries?
-- **Assigned severity** — does it track with demonstrated exploitability,
-  not just theoretical pattern severity?
+class IsolationRouter(Router):
+    """Use the job's `isolation` field as the pool name; default to docker."""
 
-Source data: report.md (human-readable) and findings.json / SARIF /
-coverage.json (structured) from either the Desktop export or CLI output.
+    def select(self, job, pools):
+        name = job.spec.get("isolation", "docker")
+        if name not in pools:
+            raise ValueError(f"pool '{name}' is not enabled")
+        return pools[name]
 
-### 4. Run Snyk reachability in parallel (fusion input)
 
-Run your existing Snyk scan against the same commit/tag of Juice Shop,
-with reachability analysis enabled, so its call-graph-based reachability
-signal (static: "is the vulnerable function ever called") is available
-for the fusion step. This is a structurally different signal from Codex's
-exploit-validated reachability — see the fusion table in step 6.
+# ------------------------------------------------------------ Orchestrator
+class Orchestrator:
+    def __init__(self, sqs, s3, intake_url, bucket, router, pools):
+        self.sqs = sqs
+        self.s3 = s3
+        self.intake_url = intake_url
+        self.bucket = bucket
+        self.router = router
+        self.pools = pools
 
-### 5. Cross-reference against ground truth
+    def jobs_from_message(self, body):
+        """An intake message is an S3 event; read each job spec it points to."""
+        data = json.loads(body)
+        jobs = []
+        for record in data.get("Records", []):
+            key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+            if not KEY_RE.match(key):
+                log.error("ignoring unexpected key %s", key)
+                continue
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            spec = json.loads(obj["Body"].read())
+            if not str(spec.get("prompt", "")).strip():
+                log.error("rejecting %s: missing prompt", key)
+                continue
+            job_id = os.path.splitext(os.path.basename(key))[0]
+            jobs.append(Job(job_id=job_id, key=key, spec=spec))
+        return jobs
 
-Compare Codex findings against the challenge list in SOLUTIONS.md and the
-official companion guide. For each known challenge category (SQLi,
-XSS — reflected/stored/DOM, broken auth, IDOR, XXE, SSRF, insecure
-deserialization, vulnerable dependencies, security misconfiguration,
-insufficient logging), record:
-- True positive / false negative / false positive
-- Whether severity matched real-world exploitability
-- Whether the finding is a "pattern-matchable" class (SQLi, XSS) or a
-  "logic/reasoning" class (IDOR, auth bypass, business logic) — score
-  these separately, since Codex Security and Snyk have different
-  strengths per class (see prior discussion: Snyk's SCA/pattern-based
-  SAST is stronger on textbook injection classes; Codex is stronger on
-  authorization/logic flaws requiring intent-aware reasoning).
+    def handle(self, message):
+        for job in self.jobs_from_message(message["Body"]):
+            try:
+                self.router.select(job, self.pools).submit(job)
+            except Exception:
+                log.exception("job %s could not be submitted", job.job_id)
 
-### 6. Fuse Snyk reachability + Codex reachability/validation into a priority tier
+    def run(self):
+        log.info("orchestrator started; pools=%s", list(self.pools))
+        while True:
+            response = self.sqs.receive_message(
+                QueueUrl=self.intake_url, MaxNumberOfMessages=1,
+                WaitTimeSeconds=20, VisibilityTimeout=120)
+            for message in response.get("Messages", []):
+                self.handle(message)
+                self.sqs.delete_message(QueueUrl=self.intake_url,
+                                        ReceiptHandle=message["ReceiptHandle"])
 
-For each finding present in either tool's output, assign a combined tier:
 
-| Snyk reachability | Codex validation | Combined tier | Meaning |
-|---|---|---|---|
-| Reachable | Validated/reproduced | Tier 1 — confirmed | Both structural and demonstrated evidence agree; highest confidence |
-| Reachable | No Codex finding | Tier 2 — statically confirmed | Trust Snyk's signal; Codex may not have explored that path (e.g. pure dependency CVE, not logic-driven) |
-| Unreachable | Validated/reproduced | Tier 3 — conflict, investigate | Codex demonstrated exploitability where Snyk's call graph says the path is dead; check for dynamic dispatch, reflection, or config-driven code Snyk's static call graph may miss |
-| Reachable | Attempted, failed to reproduce | Tier 3b — conflict, investigate | Snyk says a path exists but Codex could not trigger it; check whether Snyk is overcounting (called but not attacker-controllable) or Codex's sandbox lacked correct preconditions |
-| Unreachable | No finding | Tier 4 — low priority | Both signals agree; deprioritize |
+# ------------------------------------------------------------ Wiring (dependency injection)
+def main():
+    region = os.environ["AWS_REGION"]
+    sqs = boto3.client("sqs", region_name=region)
+    s3 = boto3.client("s3", region_name=region)
+    autoscaling = boto3.client("autoscaling", region_name=region)
 
-Route Tier 3/3b conflicts for manual review rather than auto-resolving —
-these are the cases most worth investigating by hand.
+    Orchestrator(
+        sqs=sqs,
+        s3=s3,
+        intake_url=os.environ["INTAKE_QUEUE_URL"],
+        bucket=os.environ["BUCKET"],
+        router=IsolationRouter(),
+        pools=create_pools(os.environ["POOLS"], sqs, autoscaling),
+    ).run()
 
-### 7. Score summary
 
-| Metric | Result |
-|---|---|
-| Total known challenges | |
-| True positives (Codex) | |
-| False negatives (Codex) | |
-| False positives (Codex) | |
-| Findings with correct reachability assessment | |
-| Findings with severity matching real exploitability | |
-| Pattern-matchable class: Codex vs. Snyk recall | |
-| Logic/reasoning class: Codex vs. Snyk recall | |
-| Tier 1 (confirmed) count | |
-| Tier 3 / 3b (conflict) count | |
-| Tier 4 (low priority) count | |
-| Time: baseline scan | |
-
-## Notes for Reporting
-
-- Keep raw findings (report.md, findings.json, Snyk export) alongside the
-  summary for auditability.
-- Flag any finding where Codex Security's severity/priority disagreed
-  meaningfully with actual exploitability documented in the companion
-  guide.
-- Flag any case where the threat model's stated trust boundaries didn't
-  match where a finding was actually surfaced — a reachability miss
-  worth noting separately from a plain false positive/negative.
-- Tier 3/3b conflicts are the most valuable output of this exercise —
-  they're where the two tools' different methodologies (static call
-  graph vs. threat-model-guided dynamic validation) disagree, and
-  resolving why is more informative than either tool's raw finding count.
-- Remediation/patch generation is explicitly out of scope for this skill.
-  If you later want to test Codex Security's patch-and-verify flow, do
-  that as a separate, deliberate step outside this benchmark.
+if __name__ == "__main__":
+    main()
