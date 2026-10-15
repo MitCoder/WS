@@ -1,173 +1,131 @@
 #!/usr/bin/env python3
-"""Simple orchestrator: intake SQS (S3 events) -> pick a pool -> pool queue + ASG scale-up.
+"""Minimal orchestrator: change an ASG's desired capacity. Pools come from config.
 
-Strategy             Router and Pool are swappable behaviours.
-Factory              create_pools() builds Pool objects from config (POOLS).
-Dependency injection Orchestrator and pools receive their AWS clients.
+  python3 orchestrator_min.py status            # show every pool's ASG
+  python3 orchestrator_min.py up docker         # desired +1 (up to max)
+  python3 orchestrator_min.py set docker 0      # set desired to an exact number
 
-Env: AWS_REGION, BUCKET, INTAKE_QUEUE_URL, POOLS
-POOLS example: [{"name":"docker","queue":"<url>","asg":"<name>","max":5}]
+Strategy             Pool is the swappable behaviour.
+Factory              create_pools() builds pools from POOLS config.
+Dependency injection the autoscaling client is passed in.
+
+Env: AWS_REGION, POOLS
+POOLS example: [{"name":"docker","asg":"<asg-name>","max":2}]
 """
+import argparse
 import json
 import logging
 import os
-import re
-import urllib.parse
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 import boto3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestrator")
 
-KEY_RE = re.compile(r"^inbox/[A-Za-z0-9._/-]{1,200}\.json$")
 
-
-@dataclass(frozen=True)
-class Job:
-    job_id: str
-    key: str      # S3 key of the job spec
-    spec: dict
-
-
-# ------------------------------------------------------------ Strategy 1: pools
+# ------------------------------------------------------------ Strategy: pools
 class Pool(ABC):
-    """A place jobs can run."""
+    def __init__(self, name):
+        self.name = name
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, item, autoscaling):
+        """Build the pool from one entry of POOLS."""
 
     @abstractmethod
-    def submit(self, job):
+    def status(self):
         ...
 
+    @abstractmethod
+    def set_desired(self, n):
+        ...
 
-class AsgQueuePool(Pool):
-    """Every pool that is 'SQS queue + ASG'. Differences live in config, not code."""
+    def scale_up(self):
+        self.set_desired(self.status()["desired"] + 1)
 
-    def __init__(self, name, queue_url, asg_name, max_size, sqs, autoscaling):
-        self.name = name
-        self.queue_url = queue_url
+
+class AsgPool(Pool):
+    """A pool that is just an ASG."""
+
+    def __init__(self, name, asg_name, max_size, autoscaling):
+        super().__init__(name)
         self.asg_name = asg_name
         self.max_size = max_size
-        self.sqs = sqs
         self.autoscaling = autoscaling
 
-    def submit(self, job):
-        self.sqs.send_message(
-            QueueUrl=self.queue_url,
-            MessageBody=json.dumps({"job_id": job.job_id, "key": job.key}))
-        self._scale_up()
-        log.info("job %s -> pool %s", job.job_id, self.name)
+    @classmethod
+    def from_config(cls, item, autoscaling):
+        return cls(item["name"], item["asg"], int(item["max"]), autoscaling)
 
-    def _scale_up(self):
-        group = self.autoscaling.describe_auto_scaling_groups(
-            AutoScalingGroupNames=[self.asg_name])["AutoScalingGroups"][0]
-        desired = group["DesiredCapacity"]
-        if desired < self.max_size:
-            self.autoscaling.set_desired_capacity(
-                AutoScalingGroupName=self.asg_name,
-                DesiredCapacity=desired + 1, HonorCooldown=False)
-            log.info("pool %s: asg %s -> %d", self.name, self.asg_name, desired + 1)
-        else:
-            log.info("pool %s at max; job waits in queue", self.name)
+    def status(self):
+        groups = self.autoscaling.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[self.asg_name])["AutoScalingGroups"]
+        if not groups:
+            raise SystemExit(f"ASG {self.asg_name} not found")
+        g = groups[0]
+        return {
+            "pool": self.name,
+            "asg": self.asg_name,
+            "desired": g["DesiredCapacity"],
+            "min": g["MinSize"],
+            "asg_max": g["MaxSize"],
+            "our_max": self.max_size,
+            "instances": [(i["InstanceId"], i["LifecycleState"]) for i in g["Instances"]],
+        }
+
+    def set_desired(self, n):
+        n = max(0, min(n, self.max_size))   # never exceed the configured cap
+        self.autoscaling.set_desired_capacity(
+            AutoScalingGroupName=self.asg_name, DesiredCapacity=n, HonorCooldown=False)
+        log.info("pool %s: asg %s desired -> %d", self.name, self.asg_name, n)
 
 
 # ------------------------------------------------------------ Factory
-POOL_TYPES = {"asg_queue": AsgQueuePool}   # add a subclass here only if behaviour differs
+POOL_TYPES = {"asg": AsgPool}   # later: "asg_queue": AsgQueuePool
 
 
-def create_pools(pools_json, sqs, autoscaling):
+def create_pools(pools_json, autoscaling):
     pools = {}
     for item in json.loads(pools_json):
-        pool_class = POOL_TYPES[item.get("type", "asg_queue")]
-        pools[item["name"]] = pool_class(
-            name=item["name"],
-            queue_url=item["queue"],
-            asg_name=item["asg"],
-            max_size=int(item["max"]),
-            sqs=sqs,
-            autoscaling=autoscaling)
+        pool_class = POOL_TYPES[item.get("type", "asg")]
+        pools[item["name"]] = pool_class.from_config(item, autoscaling)
     return pools
-
-
-# ------------------------------------------------------------ Strategy 2: routing
-class Router(ABC):
-    @abstractmethod
-    def select(self, job, pools):
-        """Return the Pool that should run this job."""
-
-
-class IsolationRouter(Router):
-    """Use the job's `isolation` field as the pool name; default to docker."""
-
-    def select(self, job, pools):
-        name = job.spec.get("isolation", "docker")
-        if name not in pools:
-            raise ValueError(f"pool '{name}' is not enabled")
-        return pools[name]
 
 
 # ------------------------------------------------------------ Orchestrator
 class Orchestrator:
-    def __init__(self, sqs, s3, intake_url, bucket, router, pools):
-        self.sqs = sqs
-        self.s3 = s3
-        self.intake_url = intake_url
-        self.bucket = bucket
-        self.router = router
+    def __init__(self, pools):
         self.pools = pools
 
-    def jobs_from_message(self, body):
-        """An intake message is an S3 event; read each job spec it points to."""
-        data = json.loads(body)
-        jobs = []
-        for record in data.get("Records", []):
-            key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-            if not KEY_RE.match(key):
-                log.error("ignoring unexpected key %s", key)
-                continue
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            spec = json.loads(obj["Body"].read())
-            if not str(spec.get("prompt", "")).strip():
-                log.error("rejecting %s: missing prompt", key)
-                continue
-            job_id = os.path.splitext(os.path.basename(key))[0]
-            jobs.append(Job(job_id=job_id, key=key, spec=spec))
-        return jobs
-
-    def handle(self, message):
-        for job in self.jobs_from_message(message["Body"]):
-            try:
-                self.router.select(job, self.pools).submit(job)
-            except Exception:
-                log.exception("job %s could not be submitted", job.job_id)
-
-    def run(self):
-        log.info("orchestrator started; pools=%s", list(self.pools))
-        while True:
-            response = self.sqs.receive_message(
-                QueueUrl=self.intake_url, MaxNumberOfMessages=1,
-                WaitTimeSeconds=20, VisibilityTimeout=120)
-            for message in response.get("Messages", []):
-                self.handle(message)
-                self.sqs.delete_message(QueueUrl=self.intake_url,
-                                        ReceiptHandle=message["ReceiptHandle"])
+    def pool(self, name):
+        if name not in self.pools:
+            raise SystemExit(f"unknown pool '{name}'; configured: {list(self.pools)}")
+        return self.pools[name]
 
 
 # ------------------------------------------------------------ Wiring (dependency injection)
 def main():
-    region = os.environ["AWS_REGION"]
-    sqs = boto3.client("sqs", region_name=region)
-    s3 = boto3.client("s3", region_name=region)
-    autoscaling = boto3.client("autoscaling", region_name=region)
+    parser = argparse.ArgumentParser(description="Minimal orchestrator")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status")
+    commands.add_parser("up").add_argument("pool")
+    set_cmd = commands.add_parser("set")
+    set_cmd.add_argument("pool")
+    set_cmd.add_argument("desired", type=int)
+    args = parser.parse_args()
 
-    Orchestrator(
-        sqs=sqs,
-        s3=s3,
-        intake_url=os.environ["INTAKE_QUEUE_URL"],
-        bucket=os.environ["BUCKET"],
-        router=IsolationRouter(),
-        pools=create_pools(os.environ["POOLS"], sqs, autoscaling),
-    ).run()
+    autoscaling = boto3.client("autoscaling", region_name=os.environ["AWS_REGION"])
+    orchestrator = Orchestrator(create_pools(os.environ["POOLS"], autoscaling))
+
+    if args.command == "status":
+        for pool in orchestrator.pools.values():
+            print(json.dumps(pool.status(), indent=2))
+    elif args.command == "up":
+        orchestrator.pool(args.pool).scale_up()
+    elif args.command == "set":
+        orchestrator.pool(args.pool).set_desired(args.desired)
 
 
 if __name__ == "__main__":
