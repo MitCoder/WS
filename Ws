@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
-"""Minimal orchestrator: change an ASG's desired capacity. Pools come from config.
+"""ORCHESTRATOR (runs on the orchestrator EC2; it is NOT a worker).
 
-  python3 orchestrator_min.py status            # show every pool's ASG
-  python3 orchestrator_min.py up docker         # desired +1 (up to max)
-  python3 orchestrator_min.py set docker 0      # set desired to an exact number
+Step 1 only: raise a worker fleet's ASG desired capacity.
+The workers are the EC2 instances the ASG launches from its launch template.
 
-Strategy             Pool is the swappable behaviour.
-Factory              create_pools() builds pools from POOLS config.
-Dependency injection the autoscaling client is passed in.
-
-Env: AWS_REGION, POOLS
-POOLS example: [{"name":"docker","asg":"<asg-name>","max":2}]
+Usage:
+  python3 orchestrator.py add-worker docker      # desired +1 (up to max)
+  python3 orchestrator.py status docker          # show desired / instances
+Env: AWS_REGION, WORKER_FLEETS, DRY_RUN=1 (change nothing)
+  WORKER_FLEETS example: [{"name":"docker","asg":"claude-docker-asg","max":1}]
 """
 import argparse
 import json
 import logging
 import os
-from abc import ABC, abstractmethod
 
 import boto3
 
@@ -24,108 +21,67 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("orchestrator")
 
 
-# ------------------------------------------------------------ Strategy: pools
-class Pool(ABC):
-    def __init__(self, name):
+class WorkerFleet:
+    """An ASG whose instances are workers. Its launch template decides the worker type."""
+
+    def __init__(self, name, asg_name, max_size, autoscaling, dry_run=False):
         self.name = name
-
-    @classmethod
-    @abstractmethod
-    def from_config(cls, item, autoscaling):
-        """Build the pool from one entry of POOLS."""
-
-    @abstractmethod
-    def status(self):
-        ...
-
-    @abstractmethod
-    def set_desired(self, n):
-        ...
-
-    def scale_up(self):
-        self.set_desired(self.status()["desired"] + 1)
-
-
-class AsgPool(Pool):
-    """A pool that is just an ASG."""
-
-    def __init__(self, name, asg_name, max_size, autoscaling):
-        super().__init__(name)
         self.asg_name = asg_name
         self.max_size = max_size
         self.autoscaling = autoscaling
+        self.dry_run = dry_run
 
-    @classmethod
-    def from_config(cls, item, autoscaling):
-        return cls(item["name"], item["asg"], int(item["max"]), autoscaling)
-
-    def status(self):
+    def _group(self):
         groups = self.autoscaling.describe_auto_scaling_groups(
             AutoScalingGroupNames=[self.asg_name])["AutoScalingGroups"]
         if not groups:
             raise SystemExit(f"ASG {self.asg_name} not found")
-        g = groups[0]
-        return {
-            "pool": self.name,
-            "asg": self.asg_name,
-            "desired": g["DesiredCapacity"],
-            "min": g["MinSize"],
-            "asg_max": g["MaxSize"],
-            "our_max": self.max_size,
-            "instances": [(i["InstanceId"], i["LifecycleState"]) for i in g["Instances"]],
-        }
+        return groups[0]
 
-    def set_desired(self, n):
-        n = max(0, min(n, self.max_size))   # never exceed the configured cap
+    def status(self):
+        group = self._group()
+        instances = [(i["InstanceId"], i["LifecycleState"]) for i in group["Instances"]]
+        log.info("fleet %s: desired=%d min=%d max=%d instances=%s",
+                 self.name, group["DesiredCapacity"], group["MinSize"], group["MaxSize"], instances)
+
+    def add_worker(self):
+        if self.dry_run:
+            log.info("[dry-run] asg %s would add one worker", self.asg_name)
+            return
+        desired = self._group()["DesiredCapacity"]
+        if desired >= self.max_size:
+            log.info("asg %s already at max (%d workers)", self.asg_name, desired)
+            return
         self.autoscaling.set_desired_capacity(
-            AutoScalingGroupName=self.asg_name, DesiredCapacity=n, HonorCooldown=False)
-        log.info("pool %s: asg %s desired -> %d", self.name, self.asg_name, n)
+            AutoScalingGroupName=self.asg_name,
+            DesiredCapacity=desired + 1, HonorCooldown=False)
+        log.info("asg %s desired %d -> %d", self.asg_name, desired, desired + 1)
 
 
-# ------------------------------------------------------------ Factory
-POOL_TYPES = {"asg": AsgPool}   # later: "asg_queue": AsgQueuePool
+def create_worker_fleets(fleets_json, autoscaling, dry_run=False):
+    return {
+        item["name"]: WorkerFleet(item["name"], item["asg"], int(item["max"]),
+                                  autoscaling, dry_run)
+        for item in json.loads(fleets_json)
+    }
 
 
-def create_pools(pools_json, autoscaling):
-    pools = {}
-    for item in json.loads(pools_json):
-        pool_class = POOL_TYPES[item.get("type", "asg")]
-        pools[item["name"]] = pool_class.from_config(item, autoscaling)
-    return pools
-
-
-# ------------------------------------------------------------ Orchestrator
-class Orchestrator:
-    def __init__(self, pools):
-        self.pools = pools
-
-    def pool(self, name):
-        if name not in self.pools:
-            raise SystemExit(f"unknown pool '{name}'; configured: {list(self.pools)}")
-        return self.pools[name]
-
-
-# ------------------------------------------------------------ Wiring (dependency injection)
 def main():
-    parser = argparse.ArgumentParser(description="Minimal orchestrator")
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status")
-    commands.add_parser("up").add_argument("pool")
-    set_cmd = commands.add_parser("set")
-    set_cmd.add_argument("pool")
-    set_cmd.add_argument("desired", type=int)
+    parser = argparse.ArgumentParser(description="Orchestrator: ASG test")
+    parser.add_argument("action", choices=["add-worker", "status"])
+    parser.add_argument("fleet")
     args = parser.parse_args()
 
     autoscaling = boto3.client("autoscaling", region_name=os.environ["AWS_REGION"])
-    orchestrator = Orchestrator(create_pools(os.environ["POOLS"], autoscaling))
+    fleets = create_worker_fleets(os.environ["WORKER_FLEETS"], autoscaling,
+                                  dry_run=os.environ.get("DRY_RUN") == "1")
+    if args.fleet not in fleets:
+        raise SystemExit(f"fleet '{args.fleet}' is not in WORKER_FLEETS: {list(fleets)}")
 
-    if args.command == "status":
-        for pool in orchestrator.pools.values():
-            print(json.dumps(pool.status(), indent=2))
-    elif args.command == "up":
-        orchestrator.pool(args.pool).scale_up()
-    elif args.command == "set":
-        orchestrator.pool(args.pool).set_desired(args.desired)
+    fleet = fleets[args.fleet]
+    if args.action == "add-worker":
+        fleet.add_worker()
+    fleet.status()
 
 
 if __name__ == "__main__":
