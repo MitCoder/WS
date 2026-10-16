@@ -1,1 +1,26 @@
 
+#!/bin/bash
+# Orchestrator bootstrap, rendered by Terraform and run by cloud-init at boot.
+set -euo pipefail
+
+dnf install -y python3-boto3
+mkdir -p /opt/orchestrator
+
+# orchestrator.py, embedded as base64 by Terraform
+echo '${script_b64}' | base64 -d > /opt/orchestrator/orchestrator.py
+python3 -m py_compile /opt/orchestrator/orchestrator.py
+
+# Settings the script reads from the environment
+cat > /etc/orchestrator.env <<'EOF'
+AWS_REGION=${region}
+WORKER_FLEETS='${worker_fleets_json}'
+EOF
+chmod 644 /etc/orchestrator.env
+
+# Wrapper: loads the settings, then runs the script with your arguments
+cat > /usr/local/bin/orchestrator <<'EOF'
+#!/bin/bash
+set -a; . /etc/orchestrator.env; set +a
+exec python3 /opt/orchestrator/orchestrator.py "$@"
+EOF
+chmod 755 /usr/local/bin/orchestrator
