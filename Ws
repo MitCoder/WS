@@ -1,154 +1,57 @@
+#!/bin/bash
+# Docker worker bootstrap. Rendered by Terraform templatefile().
+# Variables: region queue_url data_bucket output_bucket dry_run image ecr_registry
+#            job_timeout model_id haiku_model_id claude_args worker_py
+exec > >(tee -a /var/log/worker.log) 2>&1
+echo "=== worker bootstrap start $(date -u +%FT%TZ) ==="
 
-#!/usr/bin/env python3
-"""WORKER: one instance, one job. Runs on an EC2 launched by a worker ASG.
+# --- identity (IMDSv2) ---
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+IID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
 
-Steps: 1 read a job from the SQS queue -> 2 mark it running -> 3 run the prompt with Claude Code
-       in Docker -> 4 save output + status to S3 -> 5 delete the message -> exit.
-(The shell wrapper then terminates the instance.)
+# --- always remove this instance when we are done (success, failure or timeout) ---
+terminate_self() {
+  echo "terminating $IID"
+  aws autoscaling terminate-instance-in-auto-scaling-group \
+    --region ${region} --instance-id "$IID" --should-decrement-desired-capacity || true
+  sleep 60
+  shutdown -h now
+}
+trap terminate_self EXIT
 
-Strategy             JobRunner: DockerRunner today; add FirecrackerRunner to build_runner() later.
-Dependency injection build_runner() and main() wire everything from the environment.
+# --- tools ---
+dnf install -y python3-boto3
 
-Queue message: {"job_id": "...", "prompt": "..."}   or   {"job_id": "...", "key": "inbox/x.json"}
-Env: AWS_REGION, QUEUE_URL, BUCKET, DRY_RUN (1 = log the job and put it back)
-     docker runner: IMAGE, MODEL_ID, HAIKU_MODEL_ID, CLAUDE_ARGS, JOB_TIMEOUT
-"""
-import json
-import logging
-import os
-import re
-import shlex
-import subprocess
-from abc import ABC, abstractmethod
+if [ "${dry_run}" != "1" ]; then
+  dnf install -y docker
+  systemctl enable --now docker
+  aws ecr get-login-password --region ${region} \
+    | docker login --username AWS --password-stdin ${ecr_registry}
+  docker pull ${image}
+fi
 
-import boto3
+# --- worker.py (embedded, so it needs no S3 download) ---
+mkdir -p /opt/worker
+cat > /opt/worker/worker.py <<'WORKER_PY_EOF'
+${worker_py}
+WORKER_PY_EOF
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("worker")
+# --- settings for worker.py ---
+export AWS_REGION="${region}"
+export QUEUE_URL="${queue_url}"
+export DATA_BUCKET="${data_bucket}"
+export OUTPUT_BUCKET="${output_bucket}"
+export DRY_RUN="${dry_run}"
+export RUNNER="docker"
+export IMAGE="${image}"
+export JOB_TIMEOUT="${job_timeout}"
+export MODEL_ID="${model_id}"
+export HAIKU_MODEL_ID="${haiku_model_id}"
+export CLAUDE_ARGS='${claude_args}'
 
-ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-KEY_RE = re.compile(r"^inbox/[A-Za-z0-9._/-]{1,200}\.json$")
+# --- run one job; the trap terminates the instance afterwards ---
+timeout $(( ${job_timeout} + 900 )) python3 /opt/worker/worker.py
+echo "=== worker finished, exit $? ==="
 
-
-# ------------------------------------------------------------ Strategy: how the job is run
-class JobRunner(ABC):
-    @abstractmethod
-    def run(self, job):
-        """Run the job. Return (exit_code, output_text)."""
-
-
-class DockerRunner(JobRunner):
-    def __init__(self, image, region, model_id, haiku_model_id, claude_args, timeout):
-        self.image = image
-        self.region = region
-        self.model_id = model_id
-        self.haiku_model_id = haiku_model_id
-        self.claude_args = claude_args
-        self.timeout = timeout
-
-    def run(self, job):
-        name = f"agent-{job['job_id']}"
-        cmd = ["docker", "run", "--rm", "--name", name,
-               "-e", f"AWS_REGION={self.region}",
-               "-e", "CLAUDE_CODE_USE_BEDROCK=1",
-               "-e", f"ANTHROPIC_MODEL={self.model_id}",
-               "-e", f"ANTHROPIC_DEFAULT_HAIKU_MODEL={self.haiku_model_id}",
-               self.image, "-p", job["prompt"]] + self.claude_args
-        log.info("docker run starting (timeout %ds): %s", self.timeout, name)
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
-            return proc.returncode, proc.stdout + proc.stderr
-        except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-            return 124, f"TIMEOUT after {self.timeout}s\n"
-
-
-def build_runner(name, env):
-    if name == "docker":
-        return DockerRunner(
-            image=env["IMAGE"], region=env["AWS_REGION"], model_id=env["MODEL_ID"],
-            haiku_model_id=env["HAIKU_MODEL_ID"],
-            claude_args=shlex.split(env.get("CLAUDE_ARGS", "")),
-            timeout=int(env["JOB_TIMEOUT"]))
-    raise SystemExit(f"unknown RUNNER '{name}' (only 'docker' is built)")
-
-
-# ------------------------------------------------------------ queue and results
-def get_job(sqs, s3, queue_url, bucket, visibility, attempts=3):
-    """Step 1: take one valid job from the queue. Returns (job, receipt_handle) or (None, None)."""
-    for attempt in range(1, attempts + 1):
-        log.info("polling queue (%d/%d)", attempt, attempts)
-        response = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1,
-                                       WaitTimeSeconds=20, VisibilityTimeout=visibility)
-        for message in response.get("Messages", []):
-            receipt = message["ReceiptHandle"]
-            try:
-                body = json.loads(message["Body"])
-                job_id = str(body.get("job_id", ""))
-                prompt = body.get("prompt")
-                if prompt is None and KEY_RE.match(str(body.get("key", ""))):
-                    log.info("reading job spec s3://%s/%s", bucket, body["key"])
-                    spec = json.loads(s3.get_object(Bucket=bucket, Key=body["key"])["Body"].read())
-                    prompt = spec.get("prompt")
-                if ID_RE.match(job_id) and str(prompt or "").strip():
-                    log.info("got job %s", job_id)
-                    return {"job_id": job_id, "prompt": prompt}, receipt
-            except Exception:
-                log.exception("could not read message")
-            log.error("bad message, deleting: %s", message["Body"][:200])
-            sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
-    return None, None
-
-
-def write_status(s3, bucket, job_id, state, **extra):
-    try:
-        body = json.dumps({"state": state, **extra}).encode()
-        s3.put_object(Bucket=bucket, Key=f"status/{job_id}.json", Body=body)
-    except Exception:
-        log.exception("could not write status %s for %s", state, job_id)
-
-
-def save_result(s3, bucket, job_id, output):
-    s3.put_object(Bucket=bucket, Key=f"results/{job_id}/out.log", Body=output.encode())
-
-
-# ------------------------------------------------------------ Wiring (dependency injection)
-def main():
-    env = os.environ
-    region = env["AWS_REGION"]
-    queue_url = env["QUEUE_URL"]
-    bucket = env.get("BUCKET", "")
-    timeout = int(env.get("JOB_TIMEOUT", "3600"))
-
-    sqs = boto3.client("sqs", region_name=region)
-    s3 = boto3.client("s3", region_name=region)
-
-    job, receipt = get_job(sqs, s3, queue_url, bucket, visibility=timeout + 300)
-    if job is None:
-        log.info("no job found; exiting")
-        return
-
-    if env.get("DRY_RUN") == "1":
-        log.info("DRY RUN: job %s: %s", job["job_id"], job["prompt"][:200])
-        sqs.change_message_visibility(QueueUrl=queue_url, ReceiptHandle=receipt,
-                                      VisibilityTimeout=0)   # put it back for the next test
-        return
-
-    runner = build_runner(env.get("RUNNER", "docker"), env)
-    job_id = job["job_id"]
-
-    write_status(s3, bucket, job_id, "running")                       # step 2
-    try:
-        exit_code, output = runner.run(job)                           # step 3
-    except Exception as e:
-        log.exception("job %s failed to run", job_id)
-        exit_code, output = 1, f"worker error: {e}\n"
-
-    save_result(s3, bucket, job_id, output)                           # step 4
-    write_status(s3, bucket, job_id, "done" if exit_code == 0 else "failed", exit_code=exit_code)
-    log.info("job %s finished, exit code %d", job_id, exit_code)
-    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)    # step 5
-
-
-if __name__ == "__main__":
-    main()
