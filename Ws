@@ -1,1 +1,71 @@
+stages: [fetch, build, verify]
+
+variables:
+  PAYLOAD_IMAGE: $CI_REGISTRY_IMAGE/payload
+  TEST_JAVA_BASE: registry.sfgitlab.opr.statefarm.org/registry/sfcommon/openjdk:openjdk11-jre-alpine-3.17
+
+.dind:
+  image: docker:cli
+  services: [docker:dind]
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
+
+defender-fetch:
+  stage: fetch
+  image: registry.example.com/security/twistcli:latest   # your twistcli base image
+  script:
+    - test -n "$PRISMA_TOKEN" || { echo "PRISMA_TOKEN is not set"; exit 1; }
+    - test -n "$PRISMA_CONSOLE_URL" || { echo "PRISMA_CONSOLE_URL is not set"; exit 1; }
+    - rm -f app_embedded_embed_*.zip
+    - >
+      twistcli app-embedded embed
+      --address "$PRISMA_CONSOLE_URL"
+      --token "$PRISMA_TOKEN"
+      --app-id "base-build"
+      --data-folder /tmp
+      Dockerfile.stub
+    - unzip -tq app_embedded_embed_*.zip
+    - unzip -l app_embedded_embed_*.zip
+    - unzip -o app_embedded_embed_*.zip twistlock_defender_app_embedded.tar.gz
+    # keep only the non-secret address; never the bundle
+    - WS=$(unzip -p app_embedded_embed_*.zip Dockerfile | sed -n 's/^ENV WS_ADDRESS="\(.*\)"/\1/p')
+    - test -n "$WS" || { echo "Could not read WS_ADDRESS from generated Dockerfile"; exit 1; }
+    - sed "s|__WS_ADDRESS__|$WS|" defender-entry.sh.tpl > defender-entry.sh
+    - chmod 755 defender-entry.sh
+    - sh -n defender-entry.sh
+    - rm -f app_embedded_embed_*.zip
+  artifacts:
+    paths: [twistlock_defender_app_embedded.tar.gz, defender-entry.sh]
+    expire_in: 1 day
+
+build-payload:
+  extends: .dind
+  stage: build
+  needs: [defender-fetch]
+  script:
+    - ls -l twistlock_defender_app_embedded.tar.gz defender-entry.sh
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -f Dockerfile.payload -t "$PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA" -t "$PAYLOAD_IMAGE:poc" .
+    - docker push "$PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$PAYLOAD_IMAGE:poc"
+
+verify-payload:
+  extends: .dind
+  stage: verify
+  needs: [build-payload]
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker pull "$PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA"
+    # Build a throwaway "consuming app" image the same way real apps do
+    - |
+      printf 'FROM %s AS defender\nFROM %s\nCOPY --from=defender /defender/ /tmp/\nENTRYPOINT ["/tmp/defender-entry.sh"]\nCMD ["java","-version"]\n' \
+        "$PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA" "$TEST_JAVA_BASE" | docker build -t verify-app -f - .
+    - docker run --rm --entrypoint sh verify-app -c 'ls -l /tmp/defender /tmp/defender-entry.sh && [ -x /tmp/defender ] && [ -x /tmp/defender-entry.sh ]'
+    - docker run --rm --entrypoint sh verify-app -c 'grep -q "DEFENDER_APP_ID=\"\$TEAM_NAME\"" /tmp/defender-entry.sh'
+    - docker run --rm --entrypoint sh verify-app -c 'grep -q "wss://" /tmp/defender-entry.sh'
+    # Without TEAM_NAME it must fail fast, before the Defender launches
+    - if docker run --rm verify-app; then echo "Container started without TEAM_NAME; it should have exited"; exit 1; fi
 
