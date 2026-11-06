@@ -5,10 +5,10 @@ export DEFENDER_APP_ID="$TEAM_NAME"
 ENV_FILE="${DEFENDER_ENV_FILE:-/tmp/defender.env}"
 [ -f "$ENV_FILE" ] || { echo "defender-entry: $ENV_FILE not found" >&2; exit 1; }
 
-# Load defaults from the file; anything already set at runtime wins
 while IFS='=' read -r key value; do
-  case "$key" in ''|'#'*) continue ;; esac
-  value="${value#\"}"; value="${value%\"}"
+  case "$key" in ""|\#*) continue ;; esac
+  value="${value#\"}"
+  value="${value%\"}"
   [ -n "$(printenv "$key")" ] || export "$key=$value"
 done < "$ENV_FILE"
 
