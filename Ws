@@ -1,1 +1,104 @@
 
+"""Launcher Lambda, slice 1: observe SQS demand and decide the target worker count."""
+import json
+import logging
+import os
+from dataclasses import asdict, dataclass
+from typing import Protocol
+
+import boto3
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+
+# ---------- config ----------
+@dataclass(frozen=True)
+class Config:
+    queue_url: str
+    max_instances: int
+
+    @classmethod
+    def from_env(cls, env=os.environ) -> "Config":
+        return cls(
+            queue_url=env["QUEUE_URL"],
+            max_instances=int(env.get("MAX_INSTANCES", "5")),
+        )
+
+
+# ---------- ports (what the reconciler depends on) ----------
+class DemandSource(Protocol):
+    def pending_jobs(self) -> int: ...
+
+
+class ScalingPolicy(Protocol):
+    def target(self, jobs: int) -> int: ...
+
+
+# ---------- adapters (wrap AWS) ----------
+class SqsDemandSource:
+    """Jobs = waiting + in-flight. Both counts are approximate and can lag ~1 min."""
+
+    def __init__(self, sqs_client, queue_url: str):
+        self._sqs = sqs_client
+        self._url = queue_url
+
+    def pending_jobs(self) -> int:
+        attrs = self._sqs.get_queue_attributes(
+            QueueUrl=self._url,
+            AttributeNames=[
+                "ApproximateNumberOfMessages",
+                "ApproximateNumberOfMessagesNotVisible",
+            ],
+        )["Attributes"]
+        return (int(attrs["ApproximateNumberOfMessages"])
+                + int(attrs["ApproximateNumberOfMessagesNotVisible"]))
+
+
+# ---------- strategies (pure logic, no AWS) ----------
+class CappedScalingPolicy:
+    """One worker per job, never more than max_instances."""
+
+    def __init__(self, max_instances: int):
+        self._max = max_instances
+
+    def target(self, jobs: int) -> int:
+        return max(0, min(self._max, jobs))
+
+
+# ---------- orchestrator (depends only on the ports) ----------
+@dataclass(frozen=True)
+class Decision:
+    jobs: int
+    target: int
+
+
+class Reconciler:
+    def __init__(self, demand: DemandSource, scaling: ScalingPolicy):
+        self._demand = demand
+        self._scaling = scaling
+
+    def run(self) -> Decision:
+        jobs = self._demand.pending_jobs()
+        return Decision(jobs=jobs, target=self._scaling.target(jobs))
+
+
+# ---------- composition root (only place that knows concrete classes) ----------
+def build_reconciler(config: Config, session: boto3.Session | None = None) -> Reconciler:
+    session = session or boto3.Session()
+    return Reconciler(
+        demand=SqsDemandSource(session.client("sqs"), config.queue_url),
+        scaling=CappedScalingPolicy(config.max_instances),
+    )
+
+
+# ---------- Lambda entry point ----------
+def handler(event, context):
+    decision = build_reconciler(Config.from_env()).run()
+    log.info("decision=%s", asdict(decision))
+    return asdict(decision)
+
+
+# ---------- local run: python src/launcher.py ----------
+if __name__ == "__main__":
+    print(json.dumps(handler({}, None)))
