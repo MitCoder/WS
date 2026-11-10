@@ -1,5 +1,5 @@
 
-"""Step 1: read how many jobs are in the SQS queue."""
+"""Step 2: also count running instances, and decide how many to launch (dry run)."""
 import json
 import logging
 import os
@@ -16,23 +16,33 @@ log.setLevel(logging.INFO)
 @dataclass(frozen=True)
 class Config:
     queue_url: str
+    pool: str
+    max_instances: int
 
     @classmethod
     def from_env(cls) -> "Config":
-        return cls(queue_url=os.environ["QUEUE_URL"])
+        return cls(
+            queue_url=os.environ["QUEUE_URL"],
+            pool=os.environ["POOL"],
+            max_instances=int(os.environ.get("MAX_INSTANCES", "5")),
+        )
 
 
-# ---------- Interface: where job counts come from ----------
+# ---------- Interfaces ----------
 class JobCounter(ABC):
     @abstractmethod
     def count_jobs(self) -> int:
         """Number of jobs waiting plus jobs being worked on."""
 
 
-# ---------- Adapter: SQS implementation ----------
-class SqsJobCounter(JobCounter):
-    """SQS counts are approximate and can lag by about a minute."""
+class InstanceRegistry(ABC):
+    @abstractmethod
+    def count_running(self) -> int:
+        """Number of worker instances that are starting or running."""
 
+
+# ---------- Adapters: AWS implementations ----------
+class SqsJobCounter(JobCounter):
     def __init__(self, sqs_client, queue_url: str):
         self._sqs = sqs_client
         self._queue_url = queue_url
@@ -45,25 +55,68 @@ class SqsJobCounter(JobCounter):
                 "ApproximateNumberOfMessagesNotVisible",
             ],
         )["Attributes"]
-        waiting = int(attrs["ApproximateNumberOfMessages"])
-        in_flight = int(attrs["ApproximateNumberOfMessagesNotVisible"])
-        return waiting + in_flight
+        return (int(attrs["ApproximateNumberOfMessages"])
+                + int(attrs["ApproximateNumberOfMessagesNotVisible"]))
 
 
-# ---------- Service: the flow lives here ----------
+class Ec2InstanceRegistry(InstanceRegistry):
+    """Counts instances tagged pool=<pool>. 'pending' counts so booting hosts are included."""
+
+    def __init__(self, ec2_client, pool: str):
+        self._ec2 = ec2_client
+        self._pool = pool
+
+    def count_running(self) -> int:
+        pages = self._ec2.get_paginator("describe_instances").paginate(Filters=[
+            {"Name": "tag:pool", "Values": [self._pool]},
+            {"Name": "instance-state-name", "Values": ["pending", "running"]},
+        ])
+        return sum(len(r["Instances"]) for page in pages for r in page["Reservations"])
+
+
+# ---------- Strategy with a Template Method ----------
+class ScalingStrategy(ABC):
+    def instances_to_launch(self, jobs: int, running: int) -> int:
+        """Template method: the shared rule lives here, subclasses supply desired_instances."""
+        return max(0, self.desired_instances(jobs) - running)
+
+    @abstractmethod
+    def desired_instances(self, jobs: int) -> int:
+        """How many instances should exist for this many jobs."""
+
+
+class CappedPerJobStrategy(ScalingStrategy):
+    """One instance per job, never more than max_instances."""
+
+    def __init__(self, max_instances: int):
+        self._max_instances = max_instances
+
+    def desired_instances(self, jobs: int) -> int:
+        return min(self._max_instances, jobs)
+
+
+# ---------- Service ----------
 class ScalingService:
-    def __init__(self, job_counter: JobCounter):
+    def __init__(self, job_counter: JobCounter, registry: InstanceRegistry,
+                 strategy: ScalingStrategy):
         self._job_counter = job_counter
+        self._registry = registry
+        self._strategy = strategy
 
     def run(self) -> dict:
         jobs = self._job_counter.count_jobs()
-        return {"jobs": jobs}
+        running = self._registry.count_running()
+        to_launch = self._strategy.instances_to_launch(jobs, running)
+        return {"jobs": jobs, "running": running, "to_launch": to_launch}
 
 
-# ---------- Factory: the only place that builds concrete classes ----------
+# ---------- Factory ----------
 def create_scaling_service(config: Config) -> ScalingService:
-    sqs = boto3.client("sqs")
-    return ScalingService(job_counter=SqsJobCounter(sqs, config.queue_url))
+    return ScalingService(
+        job_counter=SqsJobCounter(boto3.client("sqs"), config.queue_url),
+        registry=Ec2InstanceRegistry(boto3.client("ec2"), config.pool),
+        strategy=CappedPerJobStrategy(config.max_instances),
+    )
 
 
 # ---------- Lambda entry point ----------
@@ -73,6 +126,6 @@ def handler(event, context):
     return result
 
 
-# ---------- Local run: python launcher.py ----------
+# ---------- Local run ----------
 if __name__ == "__main__":
     print(json.dumps(handler({}, None)))
