@@ -1,10 +1,10 @@
 
-"""Launcher Lambda, slice 1: observe SQS demand and decide the target worker count."""
+"""Step 1: read how many jobs are in the SQS queue."""
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
-from typing import Protocol
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import boto3
 
@@ -12,93 +12,67 @@ log = logging.getLogger()
 log.setLevel(logging.INFO)
 
 
-# ---------- config ----------
+# ---------- Config ----------
 @dataclass(frozen=True)
 class Config:
     queue_url: str
-    max_instances: int
 
     @classmethod
-    def from_env(cls, env=os.environ) -> "Config":
-        return cls(
-            queue_url=env["QUEUE_URL"],
-            max_instances=int(env.get("MAX_INSTANCES", "5")),
-        )
+    def from_env(cls) -> "Config":
+        return cls(queue_url=os.environ["QUEUE_URL"])
 
 
-# ---------- ports (what the reconciler depends on) ----------
-class DemandSource(Protocol):
-    def pending_jobs(self) -> int: ...
+# ---------- Interface: where job counts come from ----------
+class JobCounter(ABC):
+    @abstractmethod
+    def count_jobs(self) -> int:
+        """Number of jobs waiting plus jobs being worked on."""
 
 
-class ScalingPolicy(Protocol):
-    def target(self, jobs: int) -> int: ...
-
-
-# ---------- adapters (wrap AWS) ----------
-class SqsDemandSource:
-    """Jobs = waiting + in-flight. Both counts are approximate and can lag ~1 min."""
+# ---------- Adapter: SQS implementation ----------
+class SqsJobCounter(JobCounter):
+    """SQS counts are approximate and can lag by about a minute."""
 
     def __init__(self, sqs_client, queue_url: str):
         self._sqs = sqs_client
-        self._url = queue_url
+        self._queue_url = queue_url
 
-    def pending_jobs(self) -> int:
+    def count_jobs(self) -> int:
         attrs = self._sqs.get_queue_attributes(
-            QueueUrl=self._url,
+            QueueUrl=self._queue_url,
             AttributeNames=[
                 "ApproximateNumberOfMessages",
                 "ApproximateNumberOfMessagesNotVisible",
             ],
         )["Attributes"]
-        return (int(attrs["ApproximateNumberOfMessages"])
-                + int(attrs["ApproximateNumberOfMessagesNotVisible"]))
+        waiting = int(attrs["ApproximateNumberOfMessages"])
+        in_flight = int(attrs["ApproximateNumberOfMessagesNotVisible"])
+        return waiting + in_flight
 
 
-# ---------- strategies (pure logic, no AWS) ----------
-class CappedScalingPolicy:
-    """One worker per job, never more than max_instances."""
+# ---------- Service: the flow lives here ----------
+class ScalingService:
+    def __init__(self, job_counter: JobCounter):
+        self._job_counter = job_counter
 
-    def __init__(self, max_instances: int):
-        self._max = max_instances
-
-    def target(self, jobs: int) -> int:
-        return max(0, min(self._max, jobs))
-
-
-# ---------- orchestrator (depends only on the ports) ----------
-@dataclass(frozen=True)
-class Decision:
-    jobs: int
-    target: int
+    def run(self) -> dict:
+        jobs = self._job_counter.count_jobs()
+        return {"jobs": jobs}
 
 
-class Reconciler:
-    def __init__(self, demand: DemandSource, scaling: ScalingPolicy):
-        self._demand = demand
-        self._scaling = scaling
-
-    def run(self) -> Decision:
-        jobs = self._demand.pending_jobs()
-        return Decision(jobs=jobs, target=self._scaling.target(jobs))
-
-
-# ---------- composition root (only place that knows concrete classes) ----------
-def build_reconciler(config: Config, session: boto3.Session | None = None) -> Reconciler:
-    session = session or boto3.Session()
-    return Reconciler(
-        demand=SqsDemandSource(session.client("sqs"), config.queue_url),
-        scaling=CappedScalingPolicy(config.max_instances),
-    )
+# ---------- Factory: the only place that builds concrete classes ----------
+def create_scaling_service(config: Config) -> ScalingService:
+    sqs = boto3.client("sqs")
+    return ScalingService(job_counter=SqsJobCounter(sqs, config.queue_url))
 
 
 # ---------- Lambda entry point ----------
 def handler(event, context):
-    decision = build_reconciler(Config.from_env()).run()
-    log.info("decision=%s", asdict(decision))
-    return asdict(decision)
+    result = create_scaling_service(Config.from_env()).run()
+    log.info("result=%s", result)
+    return result
 
 
-# ---------- local run: python src/launcher.py ----------
+# ---------- Local run: python launcher.py ----------
 if __name__ == "__main__":
     print(json.dumps(handler({}, None)))
