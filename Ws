@@ -1,83 +1,72 @@
-defender-fetch:
-  stage: fetch
-  image: registry.example.com/security/twistcli:latest   # your twistcli base image
+# ---------------------------------------------------------------
+# GLOSSARY, in the order the terms show up below
+#
+# GitLab server   : stores the code and this file, and decides what runs.
+#                   It does NOT run jobs.
+# RUNNER          : a worker program (on a VM or inside a Kubernetes
+#                   cluster) that asks GitLab for jobs and runs them.
+# EXECUTOR        : the runner's "how to run a job" setting. It decides
+#                   whether jobs run in containers (Docker or Kubernetes
+#                   executor) or directly on the machine (shell executor).
+# CONTAINER IMAGE : a packaged filesystem with tools inside, like a
+#                   toolbox. Read-only and stored in a registry.
+# CONTAINER       : a running copy of an image. Each job gets a fresh one,
+#                   and it is deleted when the job ends.
+# SERVICE         : a second container started next to the job container,
+#                   for example a Docker daemon (docker:dind).
+# ---------------------------------------------------------------
+
+stages: [build, scan]
+
+# ----- Consuming app: only this part is written by the app team -----
+# include:
+#   - component: $CI_SERVER_FQDN/security/image-scan/image-scan@1.0.0
+#     inputs:
+#       image: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+build-image:
+  stage: build
+  # `image:` names the CONTAINER IMAGE that this job runs in.
+  # The RUNNER pulls it from the registry and starts a CONTAINER from it.
+  # docker:cli is a toolbox containing the `docker` command.
+  image: docker:cli
+  # `services:` starts a SECOND container beside the job container.
+  # docker:dind is a Docker daemon, so `docker build` has an engine to talk to.
+  # It needs a privileged runner (an EXECUTOR/runner setting, not your pipeline).
+  services: [docker:dind]
+  variables:
+    # Tells the docker command in the job container where the daemon is.
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
   script:
-    - test -n "$PRISMA_TOKEN" || { echo "PRISMA_TOKEN is not set"; exit 1; }
-    - test -n "$PRISMA_CONSOLE_URL" || { echo "PRISMA_CONSOLE_URL is not set"; exit 1; }
-    - rm -f app_embedded_embed_*.zip
+    # These commands run INSIDE the job CONTAINER, not on the runner machine.
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+
+# ----- Component: written once by your team -----
+image-scan:
+  stage: scan
+  # Your twistcli CONTAINER IMAGE. twistcli is baked into it, so the
+  # runner installs nothing: it pulls this image and starts a container.
+  image: registry.example.com/security/twistcli:1.0
+  services: [docker:dind]
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: /certs
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
+  script:
+    # PRISMA_CONSOLE_URL and PRISMA_TOKEN are CI/CD variables. GitLab
+    # injects them into the job CONTAINER as environment variables.
     - >
-      twistcli app-embedded embed
+      twistcli images scan
       --address "$PRISMA_CONSOLE_URL"
       --token "$PRISMA_TOKEN"
-      --app-id "base-build"
-      --data-folder /tmp
-      Dockerfile.stub
-    - unzip -tq app_embedded_embed_*.zip
-    - unzip -l app_embedded_embed_*.zip
-    - unzip -o app_embedded_embed_*.zip twistlock_defender_app_embedded.tar.gz
-    # keep the generated Dockerfile as a redacted copy for viewing (no bundle)
-    - unzip -p app_embedded_embed_*.zip Dockerfile | sed 's/^\(ENV INSTALL_BUNDLE=\).*/\1"<redacted>"/' > Dockerfile.defended.redacted
-    # build defender.env from the generated Dockerfile: allowlist only, bundle included, app ID excluded
-    - >
-      unzip -p app_embedded_embed_*.zip Dockerfile
-      | sed -n 's/^ENV \([A-Z_]*\)=\(.*\)$/\1=\2/p'
-      | tr -d '"'
-      | grep -E '^(DEFENDER_TYPE|FILESYSTEM_MONITORING|WS_ADDRESS|DATA_FOLDER|FIPS_ENABLED|INSTALL_BUNDLE)='
-      > defender.env
-    - test "$(wc -l < defender.env)" -eq 6 || { echo "defender.env should have exactly 6 lines"; exit 1; }
-    - "! grep -q DEFENDER_APP_ID defender.env"
-    - grep -q '^DEFENDER_TYPE=appEmbedded$' defender.env
-    - grep -q '^WS_ADDRESS=wss://' defender.env
-    - grep -q '^INSTALL_BUNDLE=.' defender.env
-    # record the bundle length (not the value) so verify-payload can detect corruption
-    - grep '^INSTALL_BUNDLE=' defender.env | cut -d= -f2- | tr -d '\n' | wc -c | tr -d ' ' | sed 's/^/BUNDLE_LEN=/' > build.env
-    - sh -n defender-entry.sh
-    - echo "===== Dockerfile.defended (redacted) ====="
-    - cat Dockerfile.defended.redacted
-    - sed 's/^INSTALL_BUNDLE=.*/INSTALL_BUNDLE=<redacted>/' defender.env
-    - rm -f app_embedded_embed_*.zip
-  artifacts:
-    paths:
-      - twistlock_defender_app_embedded.tar.gz
-      - defender.env
-      - Dockerfile.defended.redacted
-    reports:
-      dotenv: build.env
-    access: developer
-    expire_in: 1 day
-
-verify-payload:
-  extends: .dind
-  stage: verify
-  needs: [defender-fetch, build-payload]
-  script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker pull "$PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA"
-
-    # 1. App-style image: files present, and it fails fast without TEAM_NAME
-    - |
-      cat > Dockerfile.verify <<EOF
-      FROM $PAYLOAD_IMAGE:$CI_COMMIT_SHORT_SHA AS defender
-      FROM $TEST_JAVA_BASE
-      COPY --from=defender /defender/ /tmp/
-      ENTRYPOINT ["/tmp/defender-entry.sh"]
-      CMD ["java","-version"]
-      EOF
-    - docker build -t verify-app -f Dockerfile.verify .
-    - docker run --rm --entrypoint sh verify-app -c 'ls -l /tmp/defender /tmp/defender-entry.sh /tmp/defender.env && [ -x /tmp/defender ] && [ -x /tmp/defender-entry.sh ]'
-    - if docker run --rm verify-app; then echo "Container started without TEAM_NAME; it should have exited"; exit 1; fi
-
-    # 2. Stub in place of the Defender, to test the wrapper logic (never echo "$OUT": it holds the bundle)
-    - |
-      cat > Dockerfile.stub-verify <<EOF
-      FROM verify-app
-      RUN printf '#!/bin/sh\nenv | sort\n' > /tmp/defender && chmod 755 /tmp/defender
-      EOF
-    - docker build -t verify-stub -f Dockerfile.stub-verify .
-    - OUT=$(docker run --rm -e TEAM_NAME=ci-test verify-stub)
-    - echo "$OUT" | grep -q '^DEFENDER_APP_ID=ci-test$'
-    - echo "$OUT" | grep -q '^DEFENDER_TYPE=appEmbedded$'
-    - echo "$OUT" | grep -q '^WS_ADDRESS=wss://'
-    - test "$(echo "$OUT" | grep '^INSTALL_BUNDLE=' | cut -d= -f2- | tr -d '\n' | wc -c | tr -d ' ')" = "$BUNDLE_LEN"
-    - OUT2=$(docker run --rm -e TEAM_NAME=ci-test -e WS_ADDRESS=wss://override.example:443 verify-stub)
-    - echo "$OUT2" | grep -q '^WS_ADDRESS=wss://override.example:443$'
+      --docker-address tcp://docker:2376
+      --docker-tlscacert /certs/client/ca.pem
+      --docker-tlscert /certs/client/cert.pem
+      --docker-tlskey /certs/client/key.pem
+      --details
+      "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  # The CONTAINER is deleted when this job ends. Only `artifacts:` survive.
