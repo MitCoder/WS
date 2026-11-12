@@ -1,190 +1,36 @@
-"""Launcher Lambda: count jobs in SQS, count worker instances in EC2, start the difference."""
-import json
-import logging
-import os
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
+defender-fetch:
+  stage: fetch
+  image: registry.example.com/security/twistcli:latest   # your twistcli base image
+  script:
+    - test -n "$PRISMA_TOKEN" || { echo "PRISMA_TOKEN is not set"; exit 1; }
+    - test -n "$PRISMA_CONSOLE_URL" || { echo "PRISMA_CONSOLE_URL is not set"; exit 1; }
+    - rm -f app_embedded_embed_*.zip
+    - >
+      twistcli app-embedded embed
+      --address "$PRISMA_CONSOLE_URL"
+      --token "$PRISMA_TOKEN"
+      --app-id "base-build"
+      --data-folder /tmp
+      Dockerfile.stub
+    - unzip -tq app_embedded_embed_*.zip
+    - unzip -l app_embedded_embed_*.zip
+    - unzip -o app_embedded_embed_*.zip twistlock_defender_app_embedded.tar.gz
+    # build defender.env from the generated Dockerfile: allowlist only, never the bundle or app ID
+    - >
+      unzip -p app_embedded_embed_*.zip Dockerfile
+      | sed -n 's/^ENV \([A-Z_]*\)=\(.*\)$/\1=\2/p'
+      | tr -d '"'
+      | grep -E '^(DEFENDER_TYPE|FILESYSTEM_MONITORING|WS_ADDRESS|DATA_FOLDER|FIPS_ENABLED)='
+      > defender.env
+    - test "$(wc -l < defender.env)" -eq 5 || { echo "defender.env should have exactly 5 lines"; exit 1; }
+    - "! grep -qE 'INSTALL_BUNDLE|DEFENDER_APP_ID' defender.env"
+    - grep -q '^DEFENDER_TYPE=appEmbedded$' defender.env
+    - grep -q '^WS_ADDRESS=wss://' defender.env
+    - sh -n defender-entry.sh
+    - cat defender.env
+    - rm -f app_embedded_embed_*.zip
+  artifacts:
+    paths: [twistlock_defender_app_embedded.tar.gz, defender.env]
+    expire_in: 1 day
 
-import boto3
-from botocore.exceptions import ClientError
-
-log = logging.getLogger()
-log.setLevel(logging.INFO)
-
-
-# ---------- Config ----------
-@dataclass(frozen=True)
-class Config:
-    queue_url: str
-    tag_key: str
-    tag_value: str
-    max_instances: int
-    launch_template_id: str
-    subnet_ids: tuple
-
-    @classmethod
-    def from_env(cls) -> "Config":
-        return cls(
-            queue_url=os.environ["QUEUE_URL"],
-            tag_key=os.environ.get("TAG_KEY", "cost-center"),
-            tag_value=os.environ["TAG_VALUE"],
-            max_instances=int(os.environ.get("MAX_INSTANCES", "5")),
-            launch_template_id=os.environ["LAUNCH_TEMPLATE"],
-            subnet_ids=tuple(os.environ["SUBNET_IDS"].split(",")),
-        )
-
-
-# ---------- Interfaces ----------
-class JobCounter(ABC):
-    @abstractmethod
-    def count_jobs(self) -> int:
-        """Number of jobs waiting plus jobs being worked on."""
-
-
-class InstanceManager(ABC):
-    @abstractmethod
-    def count_running(self) -> int:
-        """Number of worker instances that are starting or running."""
-
-    @abstractmethod
-    def launch(self, count: int) -> int:
-        """Try to start `count` instances. Returns how many actually started."""
-
-
-# ---------- Adapters: AWS implementations ----------
-class SqsJobCounter(JobCounter):
-    """SQS counts are approximate and can lag by about a minute."""
-
-    def __init__(self, sqs_client, queue_url: str):
-        self._sqs = sqs_client
-        self._queue_url = queue_url
-
-    def count_jobs(self) -> int:
-        attrs = self._sqs.get_queue_attributes(
-            QueueUrl=self._queue_url,
-            AttributeNames=[
-                "ApproximateNumberOfMessages",
-                "ApproximateNumberOfMessagesNotVisible",
-            ],
-        )["Attributes"]
-        waiting = int(attrs["ApproximateNumberOfMessages"])
-        in_flight = int(attrs["ApproximateNumberOfMessagesNotVisible"])
-        return waiting + in_flight
-
-
-class Ec2InstanceManager(InstanceManager):
-    """
-    Workers are the instances tagged tag_key=tag_value.
-    The launch template MUST apply the same tag, or launched instances are never counted.
-    """
-
-    CAPACITY_ERRORS = {
-        "InsufficientInstanceCapacity",
-        "Unsupported",
-        "InsufficientFreeAddressesInSubnet",
-    }
-
-    def __init__(self, ec2_client, tag_key: str, tag_value: str,
-                 launch_template_id: str, subnet_ids: tuple):
-        self._ec2 = ec2_client
-        self._tag_key = tag_key
-        self._tag_value = tag_value
-        self._launch_template_id = launch_template_id
-        self._subnet_ids = subnet_ids
-
-    def count_running(self) -> int:
-        pages = self._ec2.get_paginator("describe_instances").paginate(Filters=[
-            {"Name": f"tag:{self._tag_key}", "Values": [self._tag_value]},
-            {"Name": "instance-state-name", "Values": ["pending", "running"]},
-        ])
-        return sum(len(r["Instances"]) for page in pages for r in page["Reservations"])
-
-    def launch(self, count: int) -> int:
-        if count <= 0:
-            return 0
-        for subnet_id in self._subnet_ids:
-            try:
-                response = self._ec2.run_instances(
-                    LaunchTemplate={"LaunchTemplateId": self._launch_template_id,
-                                    "Version": "$Latest"},
-                    MinCount=1,
-                    MaxCount=count,
-                    SubnetId=subnet_id,
-                )
-                started = len(response["Instances"])
-                log.info("launched %s instance(s) in %s", started, subnet_id)
-                return started
-            except ClientError as error:
-                code = error.response["Error"]["Code"]
-                if code in self.CAPACITY_ERRORS:
-                    log.warning("%s in %s, trying next subnet", code, subnet_id)
-                    continue
-                raise          # anything else is a real problem: surface it
-        log.error("no capacity in any subnet; next scheduled run will retry")
-        return 0
-
-
-# ---------- Strategy with a Template Method ----------
-class ScalingStrategy(ABC):
-    def instances_to_launch(self, jobs: int, running: int) -> int:
-        """Template method: shared rule here, subclasses supply desired_instances."""
-        return max(0, self.desired_instances(jobs) - running)
-
-    @abstractmethod
-    def desired_instances(self, jobs: int) -> int:
-        """How many instances should exist for this many jobs."""
-
-
-class CappedPerJobStrategy(ScalingStrategy):
-    """One instance per job, never more than max_instances."""
-
-    def __init__(self, max_instances: int):
-        self._max_instances = max_instances
-
-    def desired_instances(self, jobs: int) -> int:
-        return min(self._max_instances, jobs)
-
-
-# ---------- Service: observe, decide, act ----------
-class ScalingService:
-    def __init__(self, job_counter: JobCounter, instances: InstanceManager,
-                 strategy: ScalingStrategy):
-        self._job_counter = job_counter
-        self._instances = instances
-        self._strategy = strategy
-
-    def run(self) -> dict:
-        jobs = self._job_counter.count_jobs()                          # 1. observe
-        running = self._instances.count_running()
-        to_launch = self._strategy.instances_to_launch(jobs, running)  # 2. decide
-        launched = self._instances.launch(to_launch)                   # 3. act
-        return {"jobs": jobs, "running": running,
-                "to_launch": to_launch, "launched": launched}
-
-
-# ---------- Factory: the only place that builds concrete classes ----------
-def create_scaling_service(config: Config) -> ScalingService:
-    return ScalingService(
-        job_counter=SqsJobCounter(boto3.client("sqs"), config.queue_url),
-        instances=Ec2InstanceManager(
-            boto3.client("ec2"),
-            config.tag_key,
-            config.tag_value,
-            config.launch_template_id,
-            config.subnet_ids,
-        ),
-        strategy=CappedPerJobStrategy(config.max_instances),
-    )
-
-
-# ---------- Lambda entry point ----------
-def handler(event, context):
-    result = create_scaling_service(Config.from_env()).run()
-    log.info("result=%s", result)
-    return result
-
-
-# ---------- Local run: python launcher.py (keep this block LAST in the file) ----------
-if __name__ == "__main__":
-    print(json.dumps(handler({}, None)))
-
+   
